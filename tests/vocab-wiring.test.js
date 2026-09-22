@@ -105,3 +105,23 @@ test("quiz mode grades into mastery updates", () => {
   assert.match(panel, /显示答案/);
   assert.match(panel, /认识/);
 });
+
+test("original-mode transcript markup is highlighted and captured", () => {
+  assert.match(panel, /\.querySelectorAll\("\.transcript-text, \.transcript-original, \.transcript-translation"\)/);
+  assert.match(panel, /row\?\.querySelector\("\.transcript-original"\)\?\.textContent\?\.trim\(\)\s*\|\|\s*row\?\.querySelector\("\.transcript-text"\)/);
+});
+
+test("attribute contexts escape quotes via escapeHtmlAttr", () => {
+  assert.match(panel, /function escapeHtmlAttr\([\s\S]*?&quot;[\s\S]*?\n\}/);
+  assert.match(panel, /title="\$\{escapeHtmlAttr\(entry\.videoTitle\)\}"/);
+});
+
+test("failed vocab saves report failure instead of success", () => {
+  const saveHandler = panel.match(/action: "saveVocabEntry"[\s\S]{0,1200}/)?.[0] || "";
+  assert.match(saveHandler, /result\.status === "duplicate"[\s\S]*?else if \(result\?\.success\)/);
+  assert.match(saveHandler, /保存失败/);
+});
+
+test("search highlight walker skips nodes inside any mark", () => {
+  assert.match(panel, /closest\("button, mark"\)/);
+});

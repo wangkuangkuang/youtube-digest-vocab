@@ -1273,7 +1273,7 @@ function refreshTranscriptSearch({ preserveIndex = false, scroll = true } = {}) 
         {
           acceptNode(node) {
             const parent = node.parentElement;
-            if (!node.nodeValue || parent?.closest("button")) {
+            if (!node.nodeValue || parent?.closest("button, mark")) {
               return NodeFilter.FILTER_REJECT;
             }
             return NodeFilter.FILTER_ACCEPT;
@@ -1668,6 +1668,14 @@ function escapeHtml(text) {
 }
 
 /**
+ * Escapes for attribute contexts. textContent→innerHTML leaves double and
+ * single quotes intact, which breaks out of quoted attributes.
+ */
+function escapeHtmlAttr(text) {
+  return escapeHtml(text).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+/**
  * Renders the small subset of inline formatting commonly present in subtitle
  * tracks and model translations. Everything is escaped first; only exact,
  * attribute-free allowlisted tags are restored as markup afterwards.
@@ -1815,7 +1823,7 @@ function renderVocabList() {
         ${entry.contextZh ? `<div class="vocab-context-zh">${escapeHtml(entry.contextZh)}</div>` : '<div class="vocab-context-zh muted">（翻译未就绪）</div>'}
       </div>
       <div class="vocab-meta">
-        <button class="vocab-timestamp" type="button" title="${escapeHtml(entry.videoTitle)}">${vocabTimestampLabel(entry.timestampSeconds)}</button>
+        <button class="vocab-timestamp" type="button" title="${escapeHtmlAttr(entry.videoTitle)}">${vocabTimestampLabel(entry.timestampSeconds)}</button>
         <span class="vocab-date">${new Date(entry.createdAt).toLocaleDateString()}</span>
         <span class="vocab-actions">
           <button class="vocab-mastery mastery-${entry.mastery}" type="button">${YTD_VOCAB.MASTERY_LABELS[entry.mastery]}</button>
@@ -1958,11 +1966,11 @@ function applyVocabHighlights(rootEl) {
   if (wordsEmpty && phrasesEmpty) return;
 
   root
-    .querySelectorAll(".transcript-original, .transcript-translation")
+    .querySelectorAll(".transcript-text, .transcript-original, .transcript-translation")
     .forEach((span) => {
-      const language = span.classList.contains("transcript-original")
-        ? "en"
-        : "zh";
+      const language = span.classList.contains("transcript-translation")
+        ? "zh"
+        : "en";
       const walker = document.createTreeWalker(span, NodeFilter.SHOW_TEXT, {
         acceptNode: (node) =>
           node.parentNode && node.parentNode.closest("mark")
@@ -2266,7 +2274,10 @@ function resolveSelectionContext(range) {
   const language = anchorSpan?.classList.contains("transcript-translation")
     ? "zh"
     : "en";
-  const rowEn = row?.querySelector(".transcript-original")?.textContent?.trim() || "";
+  const rowEn =
+    row?.querySelector(".transcript-original")?.textContent?.trim() ||
+    row?.querySelector(".transcript-text")?.textContent?.trim() ||
+    "";
   const segmentId = row?.dataset.segmentId || "";
   const cachedZh = segmentId
     ? transcriptParagraphCache.get(
@@ -2523,13 +2534,15 @@ function setupExplainFeature() {
         });
         if (result?.success && result.status === "duplicate") {
           button.textContent = "已收藏";
-        } else {
+        } else if (result?.success) {
           button.textContent = "已保存";
           vocabSpeak(selectedText, selectedLanguage);
           if (typeof loadVocabEntries === "function") await loadVocabEntries();
           if (typeof refreshVocabHighlights === "function") {
             refreshVocabHighlights();
           }
+        } else {
+          button.textContent = "保存失败";
         }
       } catch {
         button.textContent = "保存失败";
