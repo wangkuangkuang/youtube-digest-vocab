@@ -202,7 +202,24 @@ async function readBoundedAiResponse(response, onActivity) {
       responseText += decoder.decode(value, { stream: true });
     }
     responseText += decoder.decode();
-    return JSON.parse(responseText.trimStart());
+    return parseBoundedJson(responseText);
+  }
+
+  /**
+   * Parses a provider response body. Throwing a descriptive error (instead
+   * of a bare SyntaxError) keeps the .catch chains in message handlers able
+   * to surface a meaningful message to the UI.
+   */
+  function parseBoundedJson(responseText) {
+    try {
+      return JSON.parse(responseText.trimStart());
+    } catch (error) {
+      const wrapped = new Error(
+        "AI provider returned malformed JSON: " + error.message,
+      );
+      wrapped.code = "AI_RESPONSE_MALFORMED_JSON";
+      throw wrapped;
+    }
   }
 
   // Some fetch implementations do not expose a readable stream. Preserve a
@@ -216,7 +233,7 @@ async function readBoundedAiResponse(response, onActivity) {
       error.code = "AI_RESPONSE_TOO_LARGE";
       throw error;
     }
-    return JSON.parse(responseText.trimStart());
+    return parseBoundedJson(responseText);
   }
 
   // Legacy/test fetch shims may expose only json(). The hard and idle timers
@@ -282,7 +299,7 @@ async function closePanelForTab(tabId, windowId) {
     // This closes the tab-specific panel used by YouTube Digest.
     await chrome.sidePanel.close({ tabId });
     return;
-  } catch (error) {
+  } catch {
     // Chrome 145+ rejects tabId when the visible instance is global. Close
     // that instance by window instead.
   }
@@ -335,7 +352,7 @@ chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
   try {
     const tab = await chrome.tabs.get(tabId);
     void updatePanelForTab(tabId, tab.url || tab.pendingUrl, windowId);
-  } catch (e) {
+  } catch {
     // Tab vanished before we could read it — nothing to do.
   }
 });
@@ -637,7 +654,7 @@ async function getPlayerVideoDetails(tabId) {
             description: details.shortDescription || "",
             duration: Number(details.lengthSeconds) || 0,
           };
-        } catch (e) {
+        } catch {
           return null;
         }
       },
@@ -911,7 +928,7 @@ function parseLooseJson(text) {
 
   try {
     return JSON.parse(cleaned);
-  } catch (firstError) {
+  } catch {
     // Most common LLM slip: a trailing comma right before a } or ].
     // e.g. ["a", "b", ]  ->  ["a", "b" ]
     const repaired = cleaned.replace(/,(\s*[}\]])/g, "$1");
@@ -1133,7 +1150,7 @@ async function handleGetVideoInfo(tabId) {
       action: "getVideoInfo",
     });
     return response;
-  } catch (error) {
+  } catch {
     return { title: "", channelName: "", description: "" };
   }
 }
@@ -1212,7 +1229,7 @@ async function handleSaveNote(
         transcript = cached[`digest_${videoId}`].transcript;
         debugLog("[YouTube Digest] Using cached transcript for note");
       }
-    } catch (e) {
+    } catch {
       debugLog("[YouTube Digest] No cached transcript, fetching...");
     }
 
