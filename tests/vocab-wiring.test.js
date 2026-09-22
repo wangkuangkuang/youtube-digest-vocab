@@ -23,3 +23,21 @@ test("storage handlers use ytd_vocab key and YTD_VOCAB helpers", () => {
   assert.match(bg, /YTD_VOCAB\.applyVocabDelete/);
   assert.match(bg, /chrome\.storage\.local\.set\(\{ ytd_vocab: /);
 });
+
+test("lookupVocabMeaning route exists with JSON-mode AI call", () => {
+  assert.match(bg, /message\.action === "lookupVocabMeaning"/);
+  assert.match(bg, /async function handleLookupVocabMeaning\(/);
+  assert.match(bg, /loadPromptSection\(\s*"vocab-lookup\.md"/);
+});
+
+test("vocab-lookup prompt file follows the prompt conventions", () => {
+  const prompt = fs.readFileSync(
+    path.resolve(__dirname, "..", "prompts", "vocab-lookup.md"),
+    "utf8",
+  );
+  assert.match(prompt, /## System prompt/);
+  assert.match(prompt, /## User prompt/);
+  assert.match(prompt, /\{selectedText\}/);
+  assert.match(prompt, /\{transcriptContext\}/);
+  assert.match(prompt, /\{videoTitle\}/);
+});

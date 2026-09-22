@@ -455,6 +455,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .catch((err) => sendResponse({ success: false, error: err.message }));
     return true;
   }
+  if (message.action === "lookupVocabMeaning") {
+    handleLookupVocabMeaning(message.text, message.contextEn, message.videoTitle)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
 
   if (message.action === "getVideoInfo") {
     handleGetVideoInfo(message.tabId)
@@ -1520,6 +1526,57 @@ async function handleDeleteVocabEntry(id) {
   const outcome = YTD_VOCAB.applyVocabDelete(result.ytd_vocab || [], id);
   await chrome.storage.local.set({ ytd_vocab: outcome.entries });
   return { success: outcome.removed };
+}
+
+/**
+ * Dictionary-style meaning for a selection. One bounded, non-thinking
+ * JSON call — the cheapest AI touchpoint in the extension.
+ */
+async function handleLookupVocabMeaning(text, contextEn, videoTitle) {
+  try {
+    const settings = await getSettings();
+    if (!settings.aiApiKey) {
+      return {
+        success: false,
+        error: "NO_AI_KEY",
+        message: "DeepSeek API key not configured.",
+      };
+    }
+    const variables = {
+      videoTitle: videoTitle || "Unknown",
+      selectedText: String(text || "").trim(),
+      transcriptContext: contextEn || "None",
+    };
+    const systemPrompt = await loadPromptSection(
+      "vocab-lookup.md",
+      "System prompt",
+      variables,
+    );
+    const userPrompt = await loadPromptSection(
+      "vocab-lookup.md",
+      "User prompt",
+      variables,
+    );
+    debugLog("[YouTube Digest] Requesting vocab lookup");
+    const { text: raw } = await requestAiCompletion({
+      maxTokens: 300,
+      responseFormat: { type: "json_object" },
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+    });
+    const parsed = JSON.parse(raw);
+    const meaning =
+      parsed && typeof parsed.meaning === "string"
+        ? parsed.meaning.trim()
+        : "";
+    if (!meaning) return { success: false, error: "EMPTY_MEANING" };
+    return { success: true, meaning: meaning };
+  } catch (error) {
+    console.error("Vocab lookup error:", error);
+    return { success: false, error: error.message };
+  }
 }
 
 async function handleExplainSelection(
