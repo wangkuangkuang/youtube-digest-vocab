@@ -106,6 +106,10 @@ let pendingTranscriptViewState = null;
 let transcriptViewStateSaveTimer = null;
 let isRestoringTranscriptView = false;
 let selectionActionsController = null;
+
+// ——— Vocab notebook state ———
+let vocabLookupGeneration = 0;
+let currentSelectionMeaning = "";
 let lastTranscriptScrollTop = 0;
 
 // ============================================================
@@ -1696,6 +1700,110 @@ function sanitizeFilename(str) {
 // TEXT SELECTION ACTIONS
 // ============================================================
 
+function vocabSpeak(text, language) {
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+  const value = String(text || "").trim();
+  if (!value) return;
+  const utterance = new SpeechSynthesisUtterance(value);
+  utterance.lang = language === "zh" ? "zh-CN" : "en-US";
+  window.speechSynthesis.cancel();
+  window.speechSynthesis.speak(utterance);
+}
+
+function clearCrossHighlight() {
+  document
+    .querySelectorAll(".cross-highlight-target")
+    .forEach((el) => el.classList.remove("cross-highlight-target"));
+}
+
+/**
+ * Highlights the counterpart-language span(s) of every row the selection
+ * touches. Bilingual mode only; single-language selections only.
+ */
+function applyCrossHighlight(range) {
+  clearCrossHighlight();
+  if (currentTranscriptMode !== "bilingual" || !range) return;
+  const anchorEl =
+    range.startContainer.nodeType === 1
+      ? range.startContainer
+      : range.startContainer.parentElement;
+  const focusEl =
+    range.endContainer.nodeType === 1
+      ? range.endContainer
+      : range.endContainer.parentElement;
+  if (!anchorEl || !focusEl) return;
+  const anchorSpan = anchorEl.closest(
+    ".transcript-original, .transcript-translation",
+  );
+  const focusSpan = focusEl.closest(
+    ".transcript-original, .transcript-translation",
+  );
+  if (!anchorSpan || !focusSpan) return;
+  const bothOriginal =
+    anchorSpan.classList.contains("transcript-original") &&
+    focusSpan.classList.contains("transcript-original");
+  const bothTranslation =
+    anchorSpan.classList.contains("transcript-translation") &&
+    focusSpan.classList.contains("transcript-translation");
+  if (!bothOriginal && !bothTranslation) return; // selection mixes languages — skip
+  const sourceIsOriginal =
+    anchorSpan.classList.contains("transcript-original");
+  const counterpart = sourceIsOriginal
+    ? ".transcript-translation"
+    : ".transcript-original";
+  document
+    .querySelectorAll("#transcriptList .transcript-entry")
+    .forEach((row) => {
+      try {
+        if (range.intersectsNode(row)) {
+          row
+            .querySelector(counterpart)
+            ?.classList.add("cross-highlight-target");
+        }
+      } catch {
+        /* range no longer valid */
+      }
+    });
+}
+
+/**
+ * Resolves the bilingual row context for a selection: which language the
+ * selection is in, the row's EN text, its cached ZH translation (never the
+ * "Waiting…" placeholder), and the row's timestamp.
+ */
+function resolveSelectionContext(range) {
+  const startElement =
+    range.startContainer.nodeType === 1
+      ? range.startContainer
+      : range.startContainer.parentElement;
+  const row = startElement?.closest(".transcript-entry");
+  const anchorSpan = startElement?.closest(
+    ".transcript-original, .transcript-translation",
+  );
+  const language = anchorSpan?.classList.contains("transcript-translation")
+    ? "zh"
+    : "en";
+  const rowEn = row?.querySelector(".transcript-original")?.textContent?.trim() || "";
+  const segmentId = row?.dataset.segmentId || "";
+  const cachedZh = segmentId
+    ? transcriptParagraphCache.get(
+        `${currentVideoId}:zh:semantic:${segmentId}`,
+      ) || ""
+    : "";
+  const rowZh =
+    cachedZh ||
+    (row?.classList.contains("translated")
+      ? row?.querySelector(".transcript-translation")?.textContent?.trim() || ""
+      : "");
+  const seconds = Number(row?.dataset.seconds);
+  return {
+    language,
+    contextEn: rowEn,
+    contextZh: rowZh,
+    timestampSeconds: Number.isFinite(seconds) ? seconds : 0,
+  };
+}
+
 /**
  * Hides actions that belong only to a live transcript selection. Clearing the
  * browser range also prevents the toolbar from returning on another tab.
@@ -1703,6 +1811,8 @@ function sanitizeFilename(str) {
 function dismissSelectionActions(clearSelection = false) {
   const tooltip = document.getElementById("explainTooltip");
   if (tooltip) tooltip.style.display = "none";
+  vocabLookupGeneration += 1; // invalidate any in-flight lookup
+  clearCrossHighlight();
   if (clearSelection) window.getSelection()?.removeAllRanges();
 }
 
@@ -1731,14 +1841,26 @@ function setupExplainFeature() {
   tooltip.setAttribute("role", "toolbar");
   tooltip.setAttribute("aria-label", "Selected transcript actions");
   tooltip.innerHTML = `
-    <button class="explain-btn" type="button">Explain</button>
-    <button class="selection-note-btn" type="button">Note</button>
+    <div class="selection-term-row">
+      <span class="selection-term"></span>
+      <button class="selection-speak-btn" type="button" title="朗读" aria-label="Read selection aloud">朗读</button>
+    </div>
+    <div class="selection-meaning"></div>
+    <div class="selection-actions">
+      <button class="selection-save-btn" type="button">收藏到单词本</button>
+      <button class="explain-btn" type="button">Explain</button>
+      <button class="selection-note-btn" type="button">Note</button>
+    </div>
   `;
   tooltip.style.display = "none";
   document.body.appendChild(tooltip);
 
   let selectedText = "";
   let selectedTimestamp = 0;
+  let selectedLanguage = "en";
+  let selectedRowEn = "";
+  let selectedRowZh = "";
+  let lastLookup = null;
 
   // Interacting with either action must preserve the transcript selection and
   // stay isolated from document and row click behavior.
@@ -1780,6 +1902,12 @@ function setupExplainFeature() {
         const rowSeconds = Number(selectedRow?.dataset.seconds);
         selectedTimestamp = Number.isFinite(rowSeconds) ? rowSeconds : 0;
 
+        const context = resolveSelectionContext(range);
+        selectedLanguage = context.language;
+        selectedRowEn = context.contextEn;
+        selectedRowZh = context.contextZh;
+        applyCrossHighlight(range);
+
         // Set the final coordinates while the toolbar is still hidden. If it
         // becomes visible first, Chrome paints it at its default left edge for
         // one frame before moving it to the selection center.
@@ -1787,6 +1915,56 @@ function setupExplainFeature() {
         tooltip.style.top = `${rect.bottom + window.scrollY + 8}px`;
         tooltip.style.left = `${rect.left + rect.width / 2}px`;
         tooltip.style.display = "flex";
+
+        const termEl = tooltip.querySelector(".selection-term");
+        const meaningEl = tooltip.querySelector(".selection-meaning");
+        const shownTerm = text.length > 60 ? text.slice(0, 60) + "…" : text;
+        termEl.textContent = shownTerm;
+        currentSelectionMeaning = "";
+
+        if (
+          YTD_VOCAB.resolveMeaningSource(text, selectedRowEn, selectedRowZh) ===
+          "cache"
+        ) {
+          currentSelectionMeaning = selectedRowZh;
+          meaningEl.textContent = currentSelectionMeaning;
+          meaningEl.classList.remove("pending", "error");
+          lastLookup = null;
+        } else if (text.length <= 200) {
+          const runLookup = () => {
+            meaningEl.textContent = "翻译中…";
+            meaningEl.classList.add("pending");
+            meaningEl.classList.remove("error");
+            vocabLookupGeneration += 1;
+            const generation = vocabLookupGeneration;
+            chrome.runtime.sendMessage(
+              {
+                action: "lookupVocabMeaning",
+                text: text,
+                contextEn: selectedRowEn,
+                videoTitle: currentVideoTitle,
+              },
+              (result) => {
+                if (generation !== vocabLookupGeneration) return;
+                if (result && result.success) {
+                  currentSelectionMeaning = result.meaning;
+                  meaningEl.textContent = result.meaning;
+                  meaningEl.classList.remove("pending", "error");
+                } else {
+                  meaningEl.textContent = "释义获取失败，点击重试";
+                  meaningEl.classList.remove("pending");
+                  meaningEl.classList.add("error");
+                }
+              },
+            );
+          };
+          lastLookup = runLookup;
+          runLookup();
+        } else {
+          meaningEl.textContent = "";
+          meaningEl.classList.remove("pending", "error");
+          lastLookup = null;
+        }
       } else {
         tooltip.style.display = "none";
       }
@@ -1815,6 +1993,69 @@ function setupExplainFeature() {
 
       tooltip.style.display = "none";
       await showExplanation(selectedText);
+    });
+
+  // Retry a failed meaning lookup on click.
+  const meaningRetryEl = tooltip.querySelector(".selection-meaning");
+  meaningRetryEl.addEventListener("click", () => {
+    if (meaningRetryEl.classList.contains("error") && lastLookup) {
+      lastLookup();
+    }
+  });
+
+  // Read the selection aloud in its own language.
+  tooltip
+    .querySelector(".selection-speak-btn")
+    .addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (selectedText) vocabSpeak(selectedText, selectedLanguage);
+    });
+
+  // Save the selection (with its context) to the vocab notebook.
+  tooltip
+    .querySelector(".selection-save-btn")
+    .addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!selectedText || !currentVideoId) return;
+
+      const button = event.currentTarget;
+      const originalText = button.textContent;
+      button.disabled = true;
+      button.textContent = "保存中…";
+      try {
+        const result = await chrome.runtime.sendMessage({
+          action: "saveVocabEntry",
+          entry: {
+            text: selectedText,
+            language: selectedLanguage,
+            meaning: currentSelectionMeaning,
+            contextEn: selectedRowEn,
+            contextZh: selectedRowZh,
+            videoId: currentVideoId,
+            videoTitle: currentVideoTitle,
+            timestampSeconds: selectedTimestamp,
+          },
+        });
+        if (result?.success && result.status === "duplicate") {
+          button.textContent = "已收藏";
+        } else {
+          button.textContent = "已保存";
+          vocabSpeak(selectedText, selectedLanguage);
+          if (typeof loadVocabEntries === "function") await loadVocabEntries();
+          if (typeof refreshVocabHighlights === "function") {
+            refreshVocabHighlights();
+          }
+        }
+      } catch {
+        button.textContent = "保存失败";
+      } finally {
+        setTimeout(() => {
+          button.textContent = originalText;
+          button.disabled = false;
+        }, 1500);
+      }
     });
 
   // Save the exact selected words at the first selected transcript row. This
@@ -2286,7 +2527,7 @@ async function playbackTrackingTick() {
 
     const currentTime = result.response.currentTime || 0;
     highlightActiveEntry(currentTime);
-  } catch (error) {
+  } catch {
     // Silently ignore — YouTube tab might be closed or navigated away
   }
 }
@@ -2526,7 +2767,7 @@ async function loadDisplayLanguageMode(videoId) {
     currentTranscriptMode = DISPLAY_LANGUAGE_MODES.has(mode)
       ? mode
       : "original";
-  } catch (error) {
+  } catch {
     currentTranscriptMode = "original";
   }
   setTranscriptModeButtons(currentTranscriptMode);

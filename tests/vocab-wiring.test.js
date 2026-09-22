@@ -4,6 +4,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const bg = fs.readFileSync(path.resolve(__dirname, "..", "background.js"), "utf8");
+const panel = fs.readFileSync(path.resolve(__dirname, "..", "sidepanel.js"), "utf8");
+const html = fs.readFileSync(path.resolve(__dirname, "..", "sidepanel.html"), "utf8");
 
 test("background loads the vocab module via importScripts", () => {
   assert.match(bg, /importScripts\("vocab\.js"\);/);
@@ -40,4 +42,24 @@ test("vocab-lookup prompt file follows the prompt conventions", () => {
   assert.match(prompt, /\{selectedText\}/);
   assert.match(prompt, /\{transcriptContext\}/);
   assert.match(prompt, /\{videoTitle\}/);
+});
+
+test("sidepanel loads vocab.js and keeps the selection card contract", () => {
+  assert.match(html, /<script src="vocab\.js"><\/script>/);
+  assert.match(panel, /tooltip\.id = "explainTooltip"/);
+  assert.match(panel, /class="explain-btn"/);
+  assert.match(panel, /class="selection-note-btn"/);
+});
+
+test("selection card performs cached-or-AI meaning lookup with a generation guard", () => {
+  assert.match(panel, /YTD_VOCAB\.resolveMeaningSource\(/);
+  assert.match(panel, /action: "lookupVocabMeaning"/);
+  assert.match(panel, /vocabLookupGeneration/);
+  assert.match(panel, /transcriptParagraphCache\.get\(/); // ZH from cache, never the placeholder
+});
+
+test("selection card saves entries and clears cross-highlight on dismiss", () => {
+  assert.match(panel, /action: "saveVocabEntry"/);
+  assert.match(panel, /cross-highlight-target/);
+  assert.match(panel, /function dismissSelectionActions\([\s\S]*?clearCrossHighlight\(\)/);
 });
