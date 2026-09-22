@@ -14,6 +14,7 @@
 // Import safe defaults and validation helpers. Secret keys live in
 // chrome.storage.local and are never part of the extension source.
 importScripts("settings.js");
+importScripts("vocab.js");
 
 const DEBUG = false;
 const AI_PROVIDER_IDLE_TIMEOUT_MS = 50_000;
@@ -408,6 +409,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "deleteNote") {
     // Delete a specific note
     handleDeleteNote(message.noteId)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (message.action === "saveVocabEntry") {
+    handleSaveVocabEntry(message.entry)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+  if (message.action === "getVocabEntries") {
+    handleGetVocabEntries(message.videoId)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+  if (message.action === "updateVocabEntry") {
+    handleUpdateVocabEntry(message.id, message.patch)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+  if (message.action === "deleteVocabEntry") {
+    handleDeleteVocabEntry(message.id)
       .then(sendResponse)
       .catch((err) => sendResponse({ success: false, error: err.message }));
     return true;
@@ -1440,6 +1466,43 @@ async function handleDeleteNote(noteId) {
   } catch (error) {
     return { success: false, error: error.message };
   }
+}
+
+/**
+ * Vocabulary notebook — mirrors the notes storage pattern, delegating
+ * pure save/update/delete semantics to YTD_VOCAB.
+ */
+async function handleSaveVocabEntry(entry) {
+  const result = await chrome.storage.local.get("ytd_vocab");
+  const outcome = YTD_VOCAB.applyVocabSave(result.ytd_vocab || [], entry);
+  await chrome.storage.local.set({ ytd_vocab: outcome.entries });
+  return {
+    success: true,
+    status: outcome.status,
+    duplicateId: outcome.duplicateId || null,
+    entry: outcome.entry || null,
+  };
+}
+
+async function handleGetVocabEntries(videoId) {
+  const result = await chrome.storage.local.get("ytd_vocab");
+  let entries = result.ytd_vocab || [];
+  if (videoId) entries = entries.filter((e) => e && e.videoId === videoId);
+  return { success: true, entries };
+}
+
+async function handleUpdateVocabEntry(id, patch) {
+  const result = await chrome.storage.local.get("ytd_vocab");
+  const outcome = YTD_VOCAB.applyVocabUpdate(result.ytd_vocab || [], id, patch);
+  await chrome.storage.local.set({ ytd_vocab: outcome.entries });
+  return { success: outcome.updated };
+}
+
+async function handleDeleteVocabEntry(id) {
+  const result = await chrome.storage.local.get("ytd_vocab");
+  const outcome = YTD_VOCAB.applyVocabDelete(result.ytd_vocab || [], id);
+  await chrome.storage.local.set({ ytd_vocab: outcome.entries });
+  return { success: outcome.removed };
 }
 
 async function handleExplainSelection(
