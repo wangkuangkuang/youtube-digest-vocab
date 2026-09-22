@@ -149,6 +149,11 @@ test("term and meaning are separated by a divider line", () => {
   assert.match(css, /\.explain-tooltip \.selection-term\s*\{[\s\S]*?border-bottom: 1px solid/);
 });
 
+test("vocab entry delete icon renders as a visible stroke icon", () => {
+  assert.match(css, /\.vocab-delete svg\s*\{[\s\S]*?stroke:\s*currentColor/);
+  assert.match(css, /\.vocab-delete svg\s*\{[\s\S]*?fill:\s*none/);
+});
+
 test("original-mode transcript markup is highlighted and captured", () => {
   assert.match(panel, /\.querySelectorAll\("\.transcript-text, \.transcript-original, \.transcript-translation"\)/);
   assert.match(panel, /row\?\.querySelector\("\.transcript-original"\)\?\.textContent\?\.trim\(\)\s*\|\|\s*row\?\.querySelector\("\.transcript-text"\)/);
