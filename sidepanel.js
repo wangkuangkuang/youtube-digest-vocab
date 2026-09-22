@@ -2109,10 +2109,10 @@ function renderVocabQuiz() {
   frame.className = "vocab-quiz-frame";
 
   if (done) {
-    const { known, fuzzy, new: newCount } = vocabQuizState.results;
+    const results = vocabQuizState.results;
     frame.innerHTML = `
       <div class="vocab-quiz-title">自测完成</div>
-      <div class="vocab-quiz-score">认识 ${known} · 模糊 ${fuzzy} · 不认识 ${newCount}</div>
+      <div class="vocab-quiz-score">认识 ${results.known} · 模糊 ${results.fuzzy} · 不认识 ${results.new}</div>
       <div class="vocab-quiz-actions">
         <button class="enhance-btn" type="button" id="vocabQuizAgain">再来一轮</button>
         <button class="enhance-btn" type="button" id="vocabQuizExit">退出自测</button>
