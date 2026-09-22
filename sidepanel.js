@@ -45,6 +45,11 @@ let interfaceTranslationInFlight = new Set();
 let interfaceTranslationFailures = new Set();
 let currentNotes = [];
 let currentNotesFilterVideoId = null;
+
+// ——— Vocab notebook (单词本) state ———
+let currentVocabEntries = [];
+let currentVocabMasteryFilter = "all";
+let currentVocabScope = "all";
 const TRANSLATION_MESSAGE_TIMEOUT_MS = 130_000;
 const TRANSLATION_BATCH_SIZE = 3;
 
@@ -461,6 +466,10 @@ function setupEventListeners() {
     setNotesFilter(true);
     loadNotes(null); // Load all notes
   });
+
+  // Vocab notebook (单词本) filters and tools
+  setupVocabTabControls();
+  void loadVocabEntries();
 }
 
 function setNotesFilter(showAll) {
@@ -1481,6 +1490,19 @@ function switchTab(tabName) {
     });
   }
 
+  // The vocab notebook opens at the top and refreshes its entries so a save
+  // made on another surface (selection card) is visible immediately.
+  if (tabName === "vocab") {
+    requestAnimationFrame(() => {
+      const contentArea = document.getElementById("contentArea");
+      const vocabPanelIsActive = document.querySelector(
+        '.tab-panel[data-panel="vocab"].active',
+      );
+      if (contentArea && vocabPanelIsActive) contentArea.scrollTop = 0;
+    });
+    void loadVocabEntries();
+  }
+
   // Translate only the visible tab. This prevents hidden surfaces from using
   // tokens or competing with the batch queue the user is waiting for.
   if (tabName === "overview") {
@@ -1694,6 +1716,195 @@ function sanitizeFilename(str) {
     .replace(/\s+/g, "-")
     .substring(0, 50)
     .toLowerCase();
+}
+
+// ============================================================
+// VOCAB NOTEBOOK (单词本) TAB
+// ============================================================
+
+async function loadVocabEntries() {
+  try {
+    const videoId = currentVocabScope === "this" ? currentVideoId : undefined;
+    const result = await chrome.runtime.sendMessage({
+      action: "getVocabEntries",
+      videoId,
+    });
+    currentVocabEntries = result?.success ? result.entries : [];
+    renderVocabList();
+    if (typeof refreshVocabHighlightIndex === "function") {
+      refreshVocabHighlightIndex();
+      refreshVocabHighlights();
+    }
+  } catch (error) {
+    debugLog("[YouTube Digest] loadVocabEntries failed:", error);
+  }
+}
+
+function filteredVocabEntries() {
+  return currentVocabEntries.filter(
+    (e) =>
+      currentVocabMasteryFilter === "all" ||
+      e.mastery === currentVocabMasteryFilter,
+  );
+}
+
+function playVocabEntry(entry) {
+  switchTab("transcript");
+  seekTo(entry.timestampSeconds);
+}
+
+function vocabTimestampLabel(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function renderVocabList() {
+  const listEl = document.getElementById("vocabList");
+  const introEl = document.getElementById("vocabIntro");
+  const countEl = document.getElementById("vocabCount");
+  if (!listEl) return;
+
+  const entries = filteredVocabEntries();
+  if (countEl) {
+    countEl.textContent = currentVocabEntries.length
+      ? `· ${currentVocabEntries.length}`
+      : "";
+  }
+
+  if (!entries.length) {
+    listEl.innerHTML = "";
+    if (introEl) introEl.style.display = "block";
+    return;
+  }
+  if (introEl) introEl.style.display = "none";
+
+  listEl.innerHTML = "";
+  entries.forEach((entry) => {
+    const item = document.createElement("div");
+    item.className = "vocab-item";
+    item.dataset.vocabId = entry.id;
+
+    const contextEnHtml = (() => {
+      const sentence = escapeHtml(entry.contextEn || "");
+      if (!sentence || !entry.text) return sentence || "—";
+      const idx = entry.contextEn.toLowerCase().indexOf(
+        YTD_VOCAB.normalizeWhitespace(entry.text).toLowerCase(),
+      );
+      if (idx === -1) return sentence;
+      return (
+        escapeHtml(entry.contextEn.slice(0, idx)) +
+        `<mark class="vocab-highlight">${escapeHtml(entry.contextEn.slice(idx, idx + entry.text.length))}</mark>` +
+        escapeHtml(entry.contextEn.slice(idx + entry.text.length))
+      );
+    })();
+
+    item.innerHTML = `
+      <div class="vocab-term-row">
+        <span class="vocab-term">${escapeHtml(entry.text)}</span>
+        <span class="vocab-lang-badge">${entry.language === "zh" ? "ZH" : "EN"}</span>
+        <button class="vocab-speak-btn" type="button" title="朗读" aria-label="朗读">朗读</button>
+      </div>
+      <div class="vocab-meaning">${escapeHtml(entry.meaning || "") || '<span class="muted">（无释义）</span>'}</div>
+      <div class="vocab-context">
+        <div class="vocab-context-en">${contextEnHtml}</div>
+        ${entry.contextZh ? `<div class="vocab-context-zh">${escapeHtml(entry.contextZh)}</div>` : '<div class="vocab-context-zh muted">（翻译未就绪）</div>'}
+      </div>
+      <div class="vocab-meta">
+        <button class="vocab-timestamp" type="button" title="${escapeHtml(entry.videoTitle)}">${vocabTimestampLabel(entry.timestampSeconds)}</button>
+        <span class="vocab-date">${new Date(entry.createdAt).toLocaleDateString()}</span>
+        <span class="vocab-actions">
+          <button class="vocab-mastery mastery-${entry.mastery}" type="button">${YTD_VOCAB.MASTERY_LABELS[entry.mastery]}</button>
+          <button class="vocab-delete" type="button" aria-label="删除" title="删除">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M3 6h18"></path>
+              <path d="M8 6V4h8v2"></path>
+              <path d="m19 6-1 14H6L5 6"></path>
+              <path d="M10 11v5"></path>
+              <path d="M14 11v5"></path>
+            </svg>
+          </button>
+        </span>
+      </div>
+    `;
+
+    item.querySelector(".vocab-speak-btn").addEventListener("click", () => {
+      vocabSpeak(entry.text, entry.language);
+    });
+    item.querySelector(".vocab-timestamp").addEventListener("click", () => {
+      if (entry.videoId === currentVideoId) {
+        playVocabEntry(entry);
+      } else {
+        window.open(YTD_VOCAB.vocabVideoUrl(entry), "_blank");
+      }
+    });
+    item.querySelector(".vocab-mastery").addEventListener("click", async () => {
+      const order = YTD_VOCAB.MASTERY_LEVELS;
+      const next = order[(order.indexOf(entry.mastery) + 1) % order.length];
+      entry.mastery = next; // optimistic
+      await chrome.runtime.sendMessage({
+        action: "updateVocabEntry",
+        id: entry.id,
+        patch: { mastery: next },
+      });
+      renderVocabList();
+      if (typeof refreshVocabHighlightIndex === "function") {
+        refreshVocabHighlightIndex();
+        refreshVocabHighlights();
+      }
+    });
+    item.querySelector(".vocab-delete").addEventListener("click", async () => {
+      await chrome.runtime.sendMessage({
+        action: "deleteVocabEntry",
+        id: entry.id,
+      });
+      currentVocabEntries = currentVocabEntries.filter(
+        (e) => e.id !== entry.id,
+      );
+      renderVocabList();
+      if (typeof refreshVocabHighlightIndex === "function") {
+        refreshVocabHighlightIndex();
+        refreshVocabHighlights();
+      }
+    });
+
+    listEl.appendChild(item);
+  });
+}
+
+function setupVocabTabControls() {
+  document.querySelectorAll("[data-vocab-mastery]").forEach((button) => {
+    button.addEventListener("click", () => {
+      currentVocabMasteryFilter = button.dataset.vocabMastery;
+      document
+        .querySelectorAll("[data-vocab-mastery]")
+        .forEach((b) => b.classList.toggle("active", b === button));
+      renderVocabList();
+    });
+  });
+  const thisBtn = document.getElementById("vocabFilterThis");
+  const allBtn = document.getElementById("vocabFilterAll");
+  thisBtn?.addEventListener("click", () => {
+    setVocabScope("this");
+    void loadVocabEntries();
+  });
+  allBtn?.addEventListener("click", () => {
+    setVocabScope("all");
+    void loadVocabEntries();
+  });
+  // default scope: all
+  setVocabScope("all");
+}
+
+function setVocabScope(scope) {
+  const thisBtn = document.getElementById("vocabFilterThis");
+  const allBtn = document.getElementById("vocabFilterAll");
+  const isAll = scope === "all";
+  allBtn?.classList.toggle("active", isAll);
+  allBtn?.setAttribute("aria-pressed", String(isAll));
+  thisBtn?.classList.toggle("active", !isAll);
+  thisBtn?.setAttribute("aria-pressed", String(!isAll));
 }
 
 // ============================================================

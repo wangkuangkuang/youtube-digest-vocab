@@ -63,3 +63,19 @@ test("selection card saves entries and clears cross-highlight on dismiss", () =>
   assert.match(panel, /cross-highlight-target/);
   assert.match(panel, /function dismissSelectionActions\([\s\S]*?clearCrossHighlight\(\)/);
 });
+
+test("vocab tab markup and tab button exist", () => {
+  assert.match(html, /data-tab="vocab"/);
+  assert.match(html, /data-panel="vocab"/);
+  assert.match(html, /id="vocabList"/);
+  assert.match(html, /id="vocabQuiz"/);
+});
+
+test("vocab list renders mastery cycle, listen-back, delete", () => {
+  assert.match(panel, /async function loadVocabEntries\(/);
+  assert.match(panel, /function renderVocabList\(/);
+  assert.match(panel, /action: "updateVocabEntry"/);
+  assert.match(panel, /action: "deleteVocabEntry"/);
+  assert.match(panel, /function playVocabEntry\(/);
+  assert.match(panel, /switchTab\("transcript"\)/);
+});
