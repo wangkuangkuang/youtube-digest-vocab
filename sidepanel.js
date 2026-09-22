@@ -45,6 +45,11 @@ let interfaceTranslationInFlight = new Set();
 let interfaceTranslationFailures = new Set();
 let currentNotes = [];
 let currentNotesFilterVideoId = null;
+
+// ——— Vocab notebook (单词本) state ———
+let currentVocabEntries = [];
+let currentVocabMasteryFilter = "all";
+let currentVocabScope = "all";
 const TRANSLATION_MESSAGE_TIMEOUT_MS = 130_000;
 const TRANSLATION_BATCH_SIZE = 3;
 
@@ -106,6 +111,10 @@ let pendingTranscriptViewState = null;
 let transcriptViewStateSaveTimer = null;
 let isRestoringTranscriptView = false;
 let selectionActionsController = null;
+
+// ——— Vocab notebook state ———
+let vocabLookupGeneration = 0;
+let currentSelectionMeaning = "";
 let lastTranscriptScrollTop = 0;
 
 // ============================================================
@@ -457,6 +466,10 @@ function setupEventListeners() {
     setNotesFilter(true);
     loadNotes(null); // Load all notes
   });
+
+  // Vocab notebook (单词本) filters and tools
+  setupVocabTabControls();
+  void loadVocabEntries();
 }
 
 function setNotesFilter(showAll) {
@@ -1095,6 +1108,9 @@ function renderTranscript() {
   // Reapply an active query after a language mode rerenders the transcript.
   refreshTranscriptSearch({ preserveIndex: false, scroll: false });
 
+  // Saved vocab words reappear highlighted after any mode rerender.
+  refreshVocabHighlights();
+
   // Start tracking video playback for auto-scroll
   startPlaybackTracking();
 }
@@ -1257,7 +1273,7 @@ function refreshTranscriptSearch({ preserveIndex = false, scroll = true } = {}) 
         {
           acceptNode(node) {
             const parent = node.parentElement;
-            if (!node.nodeValue || parent?.closest("button")) {
+            if (!node.nodeValue || parent?.closest("button, mark")) {
               return NodeFilter.FILTER_REJECT;
             }
             return NodeFilter.FILTER_ACCEPT;
@@ -1477,6 +1493,19 @@ function switchTab(tabName) {
     });
   }
 
+  // The vocab notebook opens at the top and refreshes its entries so a save
+  // made on another surface (selection card) is visible immediately.
+  if (tabName === "vocab") {
+    requestAnimationFrame(() => {
+      const contentArea = document.getElementById("contentArea");
+      const vocabPanelIsActive = document.querySelector(
+        '.tab-panel[data-panel="vocab"].active',
+      );
+      if (contentArea && vocabPanelIsActive) contentArea.scrollTop = 0;
+    });
+    void loadVocabEntries();
+  }
+
   // Translate only the visible tab. This prevents hidden surfaces from using
   // tokens or competing with the batch queue the user is waiting for.
   if (tabName === "overview") {
@@ -1639,6 +1668,14 @@ function escapeHtml(text) {
 }
 
 /**
+ * Escapes for attribute contexts. textContent→innerHTML leaves double and
+ * single quotes intact, which breaks out of quoted attributes.
+ */
+function escapeHtmlAttr(text) {
+  return escapeHtml(text).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+/**
  * Renders the small subset of inline formatting commonly present in subtitle
  * tracks and model translations. Everything is escaped first; only exact,
  * attribute-free allowlisted tags are restored as markup afterwards.
@@ -1693,8 +1730,573 @@ function sanitizeFilename(str) {
 }
 
 // ============================================================
+// VOCAB NOTEBOOK (单词本) TAB
+// ============================================================
+
+async function loadVocabEntries() {
+  try {
+    const videoId = currentVocabScope === "this" ? currentVideoId : undefined;
+    const result = await chrome.runtime.sendMessage({
+      action: "getVocabEntries",
+      videoId,
+    });
+    currentVocabEntries = result?.success ? result.entries : [];
+    renderVocabList();
+    if (typeof refreshVocabHighlightIndex === "function") {
+      refreshVocabHighlightIndex();
+      refreshVocabHighlights();
+    }
+  } catch (error) {
+    debugLog("[YouTube Digest] loadVocabEntries failed:", error);
+  }
+}
+
+function filteredVocabEntries() {
+  return currentVocabEntries.filter(
+    (e) =>
+      currentVocabMasteryFilter === "all" ||
+      e.mastery === currentVocabMasteryFilter,
+  );
+}
+
+function playVocabEntry(entry) {
+  switchTab("transcript");
+  seekTo(entry.timestampSeconds);
+}
+
+function vocabTimestampLabel(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function renderVocabList() {
+  const listEl = document.getElementById("vocabList");
+  const introEl = document.getElementById("vocabIntro");
+  const countEl = document.getElementById("vocabCount");
+  if (!listEl) return;
+
+  const entries = filteredVocabEntries();
+  if (countEl) {
+    countEl.textContent = currentVocabEntries.length
+      ? `· ${currentVocabEntries.length}`
+      : "";
+  }
+
+  if (!entries.length) {
+    listEl.innerHTML = "";
+    if (introEl) introEl.style.display = "block";
+    return;
+  }
+  if (introEl) introEl.style.display = "none";
+
+  listEl.innerHTML = "";
+  entries.forEach((entry) => {
+    const item = document.createElement("div");
+    item.className = "vocab-item";
+    item.dataset.vocabId = entry.id;
+
+    const contextEnHtml = (() => {
+      const sentence = escapeHtml(entry.contextEn || "");
+      if (!sentence || !entry.text) return sentence || "—";
+      const idx = entry.contextEn.toLowerCase().indexOf(
+        YTD_VOCAB.normalizeWhitespace(entry.text).toLowerCase(),
+      );
+      if (idx === -1) return sentence;
+      return (
+        escapeHtml(entry.contextEn.slice(0, idx)) +
+        `<mark class="vocab-highlight">${escapeHtml(entry.contextEn.slice(idx, idx + entry.text.length))}</mark>` +
+        escapeHtml(entry.contextEn.slice(idx + entry.text.length))
+      );
+    })();
+
+    item.innerHTML = `
+      <div class="vocab-term-row">
+        <span class="vocab-term">${escapeHtml(entry.text)}</span>
+        <span class="vocab-lang-badge">${entry.language === "zh" ? "ZH" : "EN"}</span>
+        <button class="vocab-speak-btn" type="button" title="朗读" aria-label="朗读">朗读</button>
+      </div>
+      <div class="vocab-meaning">${escapeHtml(entry.meaning || "") || '<span class="muted">（无释义）</span>'}</div>
+      <div class="vocab-context">
+        <div class="vocab-context-en">${contextEnHtml}</div>
+        ${entry.contextZh ? `<div class="vocab-context-zh">${escapeHtml(entry.contextZh)}</div>` : '<div class="vocab-context-zh muted">（翻译未就绪）</div>'}
+      </div>
+      <div class="vocab-meta">
+        <button class="vocab-timestamp" type="button" title="${escapeHtmlAttr(entry.videoTitle)}">${vocabTimestampLabel(entry.timestampSeconds)}</button>
+        <span class="vocab-date">${new Date(entry.createdAt).toLocaleDateString()}</span>
+        <span class="vocab-actions">
+          <button class="vocab-mastery mastery-${entry.mastery}" type="button">${YTD_VOCAB.MASTERY_LABELS[entry.mastery]}</button>
+          <button class="vocab-delete" type="button" aria-label="删除" title="删除">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M3 6h18"></path>
+              <path d="M8 6V4h8v2"></path>
+              <path d="m19 6-1 14H6L5 6"></path>
+              <path d="M10 11v5"></path>
+              <path d="M14 11v5"></path>
+            </svg>
+          </button>
+        </span>
+      </div>
+    `;
+
+    item.querySelector(".vocab-speak-btn").addEventListener("click", () => {
+      vocabSpeak(entry.text, entry.language);
+    });
+    item.querySelector(".vocab-timestamp").addEventListener("click", () => {
+      if (entry.videoId === currentVideoId) {
+        playVocabEntry(entry);
+      } else {
+        window.open(YTD_VOCAB.vocabVideoUrl(entry), "_blank");
+      }
+    });
+    item.querySelector(".vocab-mastery").addEventListener("click", async () => {
+      const order = YTD_VOCAB.MASTERY_LEVELS;
+      const next = order[(order.indexOf(entry.mastery) + 1) % order.length];
+      entry.mastery = next; // optimistic
+      await chrome.runtime.sendMessage({
+        action: "updateVocabEntry",
+        id: entry.id,
+        patch: { mastery: next },
+      });
+      renderVocabList();
+      if (typeof refreshVocabHighlightIndex === "function") {
+        refreshVocabHighlightIndex();
+        refreshVocabHighlights();
+      }
+    });
+    item.querySelector(".vocab-delete").addEventListener("click", async () => {
+      await chrome.runtime.sendMessage({
+        action: "deleteVocabEntry",
+        id: entry.id,
+      });
+      currentVocabEntries = currentVocabEntries.filter(
+        (e) => e.id !== entry.id,
+      );
+      renderVocabList();
+      if (typeof refreshVocabHighlightIndex === "function") {
+        refreshVocabHighlightIndex();
+        refreshVocabHighlights();
+      }
+    });
+
+    listEl.appendChild(item);
+  });
+}
+
+function setupVocabTabControls() {
+  document.querySelectorAll("[data-vocab-mastery]").forEach((button) => {
+    button.addEventListener("click", () => {
+      currentVocabMasteryFilter = button.dataset.vocabMastery;
+      document
+        .querySelectorAll("[data-vocab-mastery]")
+        .forEach((b) => b.classList.toggle("active", b === button));
+      renderVocabList();
+    });
+  });
+  const thisBtn = document.getElementById("vocabFilterThis");
+  const allBtn = document.getElementById("vocabFilterAll");
+  thisBtn?.addEventListener("click", () => {
+    setVocabScope("this");
+    void loadVocabEntries();
+  });
+  allBtn?.addEventListener("click", () => {
+    setVocabScope("all");
+    void loadVocabEntries();
+  });
+  // default scope: all
+  setVocabScope("all");
+  document
+    .getElementById("vocabExportCsvBtn")
+    ?.addEventListener("click", exportVocabCsv);
+  document
+    .getElementById("vocabExportAnkiBtn")
+    ?.addEventListener("click", exportVocabAnki);
+  document
+    .getElementById("vocabQuizBtn")
+    ?.addEventListener("click", startVocabQuiz);
+}
+
+function setVocabScope(scope) {
+  const thisBtn = document.getElementById("vocabFilterThis");
+  const allBtn = document.getElementById("vocabFilterAll");
+  const isAll = scope === "all";
+  allBtn?.classList.toggle("active", isAll);
+  allBtn?.setAttribute("aria-pressed", String(isAll));
+  thisBtn?.classList.toggle("active", !isAll);
+  thisBtn?.setAttribute("aria-pressed", String(!isAll));
+}
+
+// ============================================================
+// VOCAB RE-APPEARANCE HIGHLIGHT ENGINE
+// ============================================================
+
+let vocabHighlightIndex = null;
+let vocabHighlightKnown = false; // future setting hook; default off
+
+function refreshVocabHighlightIndex() {
+  vocabHighlightIndex = YTD_VOCAB.buildVocabIndex(currentVocabEntries, {
+    highlightKnown: vocabHighlightKnown,
+  });
+}
+
+function clearVocabHighlights(root) {
+  (root || document)
+    .querySelectorAll("mark.vocab-highlight")
+    .forEach((mark) => {
+      const parent = mark.parentNode;
+      if (!parent) return;
+      parent.replaceChild(
+        document.createTextNode(mark.textContent || ""),
+        mark,
+      );
+      parent.normalize();
+    });
+}
+
+function applyVocabHighlights(rootEl) {
+  const root = rootEl || document.getElementById("transcriptList");
+  if (!root || !vocabHighlightIndex) return;
+  const wordsEmpty =
+    !vocabHighlightIndex.words.en.size &&
+    !vocabHighlightIndex.words.zh.size;
+  const phrasesEmpty =
+    !vocabHighlightIndex.phrases.en.length &&
+    !vocabHighlightIndex.phrases.zh.length;
+  if (wordsEmpty && phrasesEmpty) return;
+
+  root
+    .querySelectorAll(".transcript-text, .transcript-original, .transcript-translation")
+    .forEach((span) => {
+      const language = span.classList.contains("transcript-translation")
+        ? "zh"
+        : "en";
+      const walker = document.createTreeWalker(span, NodeFilter.SHOW_TEXT, {
+        acceptNode: (node) =>
+          node.parentNode && node.parentNode.closest("mark")
+            ? NodeFilter.FILTER_REJECT
+            : NodeFilter.FILTER_ACCEPT,
+      });
+      const textNodes = [];
+      let node;
+      while ((node = walker.nextNode())) textNodes.push(node);
+
+      textNodes.forEach((textNode) => {
+        const matches = YTD_VOCAB.findVocabMatches(
+          textNode.nodeValue,
+          vocabHighlightIndex,
+          language,
+        );
+        if (!matches.length) return;
+        const fragment = document.createDocumentFragment();
+        let cursor = 0;
+        matches.forEach(({ start, end, entryId }) => {
+          if (start > cursor) {
+            fragment.appendChild(
+              document.createTextNode(textNode.nodeValue.slice(cursor, start)),
+            );
+          }
+          const mark = document.createElement("mark");
+          mark.className = "vocab-highlight";
+          mark.dataset.vocabId = entryId;
+          mark.title = "已收藏";
+          mark.textContent = textNode.nodeValue.slice(start, end);
+          fragment.appendChild(mark);
+          cursor = end;
+        });
+        if (cursor < textNode.nodeValue.length) {
+          fragment.appendChild(
+            document.createTextNode(textNode.nodeValue.slice(cursor)),
+          );
+        }
+        textNode.parentNode.replaceChild(fragment, textNode);
+      });
+    });
+}
+
+function refreshVocabHighlights() {
+  if (!vocabHighlightIndex) refreshVocabHighlightIndex();
+  const list = document.getElementById("transcriptList");
+  if (!list) return;
+  clearVocabHighlights(list);
+  applyVocabHighlights(list);
+}
+
+// ============================================================
+// VOCAB EXPORT + CLOZE QUIZ
+// ============================================================
+
+function downloadTextFile(filename, content, mime) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function vocabExportDate() {
+  return new Date().toISOString().slice(0, 10).replace(/-/g, "");
+}
+
+function exportVocabCsv() {
+  if (!currentVocabEntries.length) return;
+  downloadTextFile(
+    `youtube-digest-vocab-${vocabExportDate()}.csv`,
+    YTD_VOCAB.toCsv(currentVocabEntries),
+    "text/csv;charset=utf-8",
+  );
+}
+
+function exportVocabAnki() {
+  if (!currentVocabEntries.length) return;
+  downloadTextFile(
+    `youtube-digest-vocab-anki-${vocabExportDate()}.txt`,
+    YTD_VOCAB.toAnkiTsv(currentVocabEntries),
+    "text/plain;charset=utf-8",
+  );
+}
+
+let vocabQuizState = null;
+
+function startVocabQuiz() {
+  const pool = filteredVocabEntries();
+  if (!pool.length) return;
+  vocabQuizState = {
+    questions: YTD_VOCAB.generateClozeQuestions(
+      pool,
+      10,
+      Date.now() % 2147483647,
+    ),
+    index: 0,
+    results: { known: 0, fuzzy: 0, new: 0 },
+  };
+  renderVocabQuiz();
+}
+
+function exitVocabQuiz() {
+  vocabQuizState = null;
+  const quizEl = document.getElementById("vocabQuiz");
+  const listEl = document.getElementById("vocabList");
+  if (quizEl) {
+    quizEl.hidden = true;
+    quizEl.innerHTML = "";
+  }
+  if (listEl) listEl.style.display = "";
+  renderVocabList();
+}
+
+async function gradeVocabQuizQuestion(mastery) {
+  if (!vocabQuizState) return;
+  const question = vocabQuizState.questions[vocabQuizState.index];
+  vocabQuizState.results[mastery] = (vocabQuizState.results[mastery] || 0) + 1;
+  question.entry.mastery = mastery; // optimistic local
+  await chrome.runtime.sendMessage({
+    action: "updateVocabEntry",
+    id: question.entry.id,
+    patch: { mastery },
+  });
+  vocabQuizState.index += 1;
+  renderVocabQuiz();
+}
+
+function renderVocabQuiz() {
+  const quizEl = document.getElementById("vocabQuiz");
+  const listEl = document.getElementById("vocabList");
+  if (!quizEl) return;
+  if (!vocabQuizState) return;
+  quizEl.hidden = false;
+  if (listEl) listEl.style.display = "none";
+  quizEl.innerHTML = "";
+
+  const done = vocabQuizState.index >= vocabQuizState.questions.length;
+  const frame = document.createElement("div");
+  frame.className = "vocab-quiz-frame";
+
+  if (done) {
+    const results = vocabQuizState.results;
+    frame.innerHTML = `
+      <div class="vocab-quiz-title">自测完成</div>
+      <div class="vocab-quiz-score">认识 ${results.known} · 模糊 ${results.fuzzy} · 不认识 ${results.new}</div>
+      <div class="vocab-quiz-actions">
+        <button class="enhance-btn" type="button" id="vocabQuizAgain">再来一轮</button>
+        <button class="enhance-btn" type="button" id="vocabQuizExit">退出自测</button>
+      </div>
+    `;
+    quizEl.appendChild(frame);
+    frame.querySelector("#vocabQuizAgain").addEventListener("click", () => {
+      startVocabQuiz();
+    });
+    frame.querySelector("#vocabQuizExit").addEventListener("click", () => {
+      exitVocabQuiz();
+      refreshVocabHighlightIndex();
+      refreshVocabHighlights();
+    });
+    return;
+  }
+
+  const question = vocabQuizState.questions[vocabQuizState.index];
+  const total = vocabQuizState.questions.length;
+  const number = vocabQuizState.index + 1;
+
+  frame.innerHTML = `
+    <div class="vocab-quiz-progress">${number} / ${total}
+      <button class="vocab-quiz-cancel" type="button">退出</button>
+    </div>
+    <div class="vocab-quiz-prompt">${
+      question.hasContext
+        ? escapeHtml(question.prompt)
+        : `该词条暂无原句：${escapeHtml(question.entry.text)}`
+    }</div>
+    ${question.hint ? `<div class="vocab-quiz-hint">提示：${escapeHtml(question.hint)}</div>` : ""}
+    <div class="vocab-quiz-reveal" hidden>
+      <div class="vocab-quiz-answer">${escapeHtml(question.entry.text)}</div>
+      ${question.entry.contextEn ? `<div class="vocab-quiz-sentence">${escapeHtml(question.entry.contextEn)}</div>` : ""}
+    </div>
+    <div class="vocab-quiz-actions">
+      <button class="enhance-btn" type="button" id="vocabQuizReveal">显示答案</button>
+      <span class="vocab-quiz-grades" hidden>
+        <button class="vocab-mastery mastery-known" type="button">认识</button>
+        <button class="vocab-mastery mastery-fuzzy" type="button">模糊</button>
+        <button class="vocab-mastery mastery-new" type="button">不认识</button>
+      </span>
+    </div>
+  `;
+  quizEl.appendChild(frame);
+
+  const revealBox = frame.querySelector(".vocab-quiz-reveal");
+  const grades = frame.querySelector(".vocab-quiz-grades");
+  frame.querySelector("#vocabQuizReveal").addEventListener("click", () => {
+    revealBox.hidden = false;
+    grades.hidden = false;
+    frame.querySelector("#vocabQuizReveal").disabled = true;
+  });
+  frame.querySelector(".vocab-quiz-cancel").addEventListener("click", () => {
+    exitVocabQuiz();
+  });
+  grades
+    .querySelectorAll(".vocab-mastery")
+    .forEach((button) =>
+      button.addEventListener("click", () => {
+        const map = { 认识: "known", 模糊: "fuzzy", 不认识: "new" };
+        void gradeVocabQuizQuestion(map[button.textContent]);
+      }),
+    );
+}
+
+// ============================================================
 // TEXT SELECTION ACTIONS
 // ============================================================
+
+function vocabSpeak(text, language) {
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+  const value = String(text || "").trim();
+  if (!value) return;
+  const utterance = new SpeechSynthesisUtterance(value);
+  utterance.lang = language === "zh" ? "zh-CN" : "en-US";
+  window.speechSynthesis.cancel();
+  window.speechSynthesis.speak(utterance);
+}
+
+function clearCrossHighlight() {
+  document
+    .querySelectorAll(".cross-highlight-target")
+    .forEach((el) => el.classList.remove("cross-highlight-target"));
+}
+
+/**
+ * Highlights the counterpart-language span(s) of every row the selection
+ * touches. Bilingual mode only; single-language selections only.
+ */
+function applyCrossHighlight(range) {
+  clearCrossHighlight();
+  if (currentTranscriptMode !== "bilingual" || !range) return;
+  const anchorEl =
+    range.startContainer.nodeType === 1
+      ? range.startContainer
+      : range.startContainer.parentElement;
+  const focusEl =
+    range.endContainer.nodeType === 1
+      ? range.endContainer
+      : range.endContainer.parentElement;
+  if (!anchorEl || !focusEl) return;
+  const anchorSpan = anchorEl.closest(
+    ".transcript-original, .transcript-translation",
+  );
+  const focusSpan = focusEl.closest(
+    ".transcript-original, .transcript-translation",
+  );
+  if (!anchorSpan || !focusSpan) return;
+  const bothOriginal =
+    anchorSpan.classList.contains("transcript-original") &&
+    focusSpan.classList.contains("transcript-original");
+  const bothTranslation =
+    anchorSpan.classList.contains("transcript-translation") &&
+    focusSpan.classList.contains("transcript-translation");
+  if (!bothOriginal && !bothTranslation) return; // selection mixes languages — skip
+  const sourceIsOriginal =
+    anchorSpan.classList.contains("transcript-original");
+  const counterpart = sourceIsOriginal
+    ? ".transcript-translation"
+    : ".transcript-original";
+  document
+    .querySelectorAll("#transcriptList .transcript-entry")
+    .forEach((row) => {
+      try {
+        if (range.intersectsNode(row)) {
+          row
+            .querySelector(counterpart)
+            ?.classList.add("cross-highlight-target");
+        }
+      } catch {
+        /* range no longer valid */
+      }
+    });
+}
+
+/**
+ * Resolves the bilingual row context for a selection: which language the
+ * selection is in, the row's EN text, its cached ZH translation (never the
+ * "Waiting…" placeholder), and the row's timestamp.
+ */
+function resolveSelectionContext(range) {
+  const startElement =
+    range.startContainer.nodeType === 1
+      ? range.startContainer
+      : range.startContainer.parentElement;
+  const row = startElement?.closest(".transcript-entry");
+  const anchorSpan = startElement?.closest(
+    ".transcript-original, .transcript-translation",
+  );
+  const language = anchorSpan?.classList.contains("transcript-translation")
+    ? "zh"
+    : "en";
+  const rowEn =
+    row?.querySelector(".transcript-original")?.textContent?.trim() ||
+    row?.querySelector(".transcript-text")?.textContent?.trim() ||
+    "";
+  const segmentId = row?.dataset.segmentId || "";
+  const cachedZh = segmentId
+    ? transcriptParagraphCache.get(
+        `${currentVideoId}:zh:semantic:${segmentId}`,
+      ) || ""
+    : "";
+  const rowZh =
+    cachedZh ||
+    (row?.classList.contains("translated")
+      ? row?.querySelector(".transcript-translation")?.textContent?.trim() || ""
+      : "");
+  const seconds = Number(row?.dataset.seconds);
+  return {
+    language,
+    contextEn: rowEn,
+    contextZh: rowZh,
+    timestampSeconds: Number.isFinite(seconds) ? seconds : 0,
+  };
+}
 
 /**
  * Hides actions that belong only to a live transcript selection. Clearing the
@@ -1703,6 +2305,8 @@ function sanitizeFilename(str) {
 function dismissSelectionActions(clearSelection = false) {
   const tooltip = document.getElementById("explainTooltip");
   if (tooltip) tooltip.style.display = "none";
+  vocabLookupGeneration += 1; // invalidate any in-flight lookup
+  clearCrossHighlight();
   if (clearSelection) window.getSelection()?.removeAllRanges();
 }
 
@@ -1731,14 +2335,26 @@ function setupExplainFeature() {
   tooltip.setAttribute("role", "toolbar");
   tooltip.setAttribute("aria-label", "Selected transcript actions");
   tooltip.innerHTML = `
-    <button class="explain-btn" type="button">Explain</button>
-    <button class="selection-note-btn" type="button">Note</button>
+    <div class="selection-term-row">
+      <span class="selection-term"></span>
+      <button class="selection-speak-btn" type="button" title="朗读" aria-label="Read selection aloud">朗读</button>
+    </div>
+    <div class="selection-meaning"></div>
+    <div class="selection-actions">
+      <button class="selection-save-btn" type="button">收藏到单词本</button>
+      <button class="explain-btn" type="button">Explain</button>
+      <button class="selection-note-btn" type="button">Note</button>
+    </div>
   `;
   tooltip.style.display = "none";
   document.body.appendChild(tooltip);
 
   let selectedText = "";
   let selectedTimestamp = 0;
+  let selectedLanguage = "en";
+  let selectedRowEn = "";
+  let selectedRowZh = "";
+  let lastLookup = null;
 
   // Interacting with either action must preserve the transcript selection and
   // stay isolated from document and row click behavior.
@@ -1780,6 +2396,12 @@ function setupExplainFeature() {
         const rowSeconds = Number(selectedRow?.dataset.seconds);
         selectedTimestamp = Number.isFinite(rowSeconds) ? rowSeconds : 0;
 
+        const context = resolveSelectionContext(range);
+        selectedLanguage = context.language;
+        selectedRowEn = context.contextEn;
+        selectedRowZh = context.contextZh;
+        applyCrossHighlight(range);
+
         // Set the final coordinates while the toolbar is still hidden. If it
         // becomes visible first, Chrome paints it at its default left edge for
         // one frame before moving it to the selection center.
@@ -1787,6 +2409,56 @@ function setupExplainFeature() {
         tooltip.style.top = `${rect.bottom + window.scrollY + 8}px`;
         tooltip.style.left = `${rect.left + rect.width / 2}px`;
         tooltip.style.display = "flex";
+
+        const termEl = tooltip.querySelector(".selection-term");
+        const meaningEl = tooltip.querySelector(".selection-meaning");
+        const shownTerm = text.length > 60 ? text.slice(0, 60) + "…" : text;
+        termEl.textContent = shownTerm;
+        currentSelectionMeaning = "";
+
+        if (
+          YTD_VOCAB.resolveMeaningSource(text, selectedRowEn, selectedRowZh) ===
+          "cache"
+        ) {
+          currentSelectionMeaning = selectedRowZh;
+          meaningEl.textContent = currentSelectionMeaning;
+          meaningEl.classList.remove("pending", "error");
+          lastLookup = null;
+        } else if (text.length <= 200) {
+          const runLookup = () => {
+            meaningEl.textContent = "翻译中…";
+            meaningEl.classList.add("pending");
+            meaningEl.classList.remove("error");
+            vocabLookupGeneration += 1;
+            const generation = vocabLookupGeneration;
+            chrome.runtime.sendMessage(
+              {
+                action: "lookupVocabMeaning",
+                text: text,
+                contextEn: selectedRowEn,
+                videoTitle: currentVideoTitle,
+              },
+              (result) => {
+                if (generation !== vocabLookupGeneration) return;
+                if (result && result.success) {
+                  currentSelectionMeaning = result.meaning;
+                  meaningEl.textContent = result.meaning;
+                  meaningEl.classList.remove("pending", "error");
+                } else {
+                  meaningEl.textContent = "释义获取失败，点击重试";
+                  meaningEl.classList.remove("pending");
+                  meaningEl.classList.add("error");
+                }
+              },
+            );
+          };
+          lastLookup = runLookup;
+          runLookup();
+        } else {
+          meaningEl.textContent = "";
+          meaningEl.classList.remove("pending", "error");
+          lastLookup = null;
+        }
       } else {
         tooltip.style.display = "none";
       }
@@ -1815,6 +2487,71 @@ function setupExplainFeature() {
 
       tooltip.style.display = "none";
       await showExplanation(selectedText);
+    });
+
+  // Retry a failed meaning lookup on click.
+  const meaningRetryEl = tooltip.querySelector(".selection-meaning");
+  meaningRetryEl.addEventListener("click", () => {
+    if (meaningRetryEl.classList.contains("error") && lastLookup) {
+      lastLookup();
+    }
+  });
+
+  // Read the selection aloud in its own language.
+  tooltip
+    .querySelector(".selection-speak-btn")
+    .addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (selectedText) vocabSpeak(selectedText, selectedLanguage);
+    });
+
+  // Save the selection (with its context) to the vocab notebook.
+  tooltip
+    .querySelector(".selection-save-btn")
+    .addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!selectedText || !currentVideoId) return;
+
+      const button = event.currentTarget;
+      const originalText = button.textContent;
+      button.disabled = true;
+      button.textContent = "保存中…";
+      try {
+        const result = await chrome.runtime.sendMessage({
+          action: "saveVocabEntry",
+          entry: {
+            text: selectedText,
+            language: selectedLanguage,
+            meaning: currentSelectionMeaning,
+            contextEn: selectedRowEn,
+            contextZh: selectedRowZh,
+            videoId: currentVideoId,
+            videoTitle: currentVideoTitle,
+            timestampSeconds: selectedTimestamp,
+          },
+        });
+        if (result?.success && result.status === "duplicate") {
+          button.textContent = "已收藏";
+        } else if (result?.success) {
+          button.textContent = "已保存";
+          vocabSpeak(selectedText, selectedLanguage);
+          if (typeof loadVocabEntries === "function") await loadVocabEntries();
+          if (typeof refreshVocabHighlights === "function") {
+            refreshVocabHighlights();
+          }
+        } else {
+          button.textContent = "保存失败";
+        }
+      } catch {
+        button.textContent = "保存失败";
+      } finally {
+        setTimeout(() => {
+          button.textContent = originalText;
+          button.disabled = false;
+        }, 1500);
+      }
     });
 
   // Save the exact selected words at the first selected transcript row. This
@@ -2286,7 +3023,7 @@ async function playbackTrackingTick() {
 
     const currentTime = result.response.currentTime || 0;
     highlightActiveEntry(currentTime);
-  } catch (error) {
+  } catch {
     // Silently ignore — YouTube tab might be closed or navigated away
   }
 }
@@ -2526,7 +3263,7 @@ async function loadDisplayLanguageMode(videoId) {
     currentTranscriptMode = DISPLAY_LANGUAGE_MODES.has(mode)
       ? mode
       : "original";
-  } catch (error) {
+  } catch {
     currentTranscriptMode = "original";
   }
   setTranscriptModeButtons(currentTranscriptMode);
@@ -2656,6 +3393,8 @@ function renderTranscriptModeRows(segments, mode) {
   // Bilingual mode can find source text before each translation arrives.
   refreshTranscriptSearch({ preserveIndex: false, scroll: false });
 
+  refreshVocabHighlights();
+
   startPlaybackTracking();
   return rows;
 }
@@ -2725,6 +3464,9 @@ function updateTranslatedRow(segment, index, alignedItem, generation) {
       retryTranslationSegment(index, generation);
     });
   }
+
+  // The rerendered row lost its vocab marks — reapply them.
+  applyVocabHighlights(row);
 }
 
 let activeTranslationQueue = null;

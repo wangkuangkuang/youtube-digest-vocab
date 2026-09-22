@@ -14,6 +14,7 @@
 // Import safe defaults and validation helpers. Secret keys live in
 // chrome.storage.local and are never part of the extension source.
 importScripts("settings.js");
+importScripts("vocab.js");
 
 const DEBUG = false;
 const AI_PROVIDER_IDLE_TIMEOUT_MS = 50_000;
@@ -201,7 +202,24 @@ async function readBoundedAiResponse(response, onActivity) {
       responseText += decoder.decode(value, { stream: true });
     }
     responseText += decoder.decode();
-    return JSON.parse(responseText.trimStart());
+    return parseBoundedJson(responseText);
+  }
+
+  /**
+   * Parses a provider response body. Throwing a descriptive error (instead
+   * of a bare SyntaxError) keeps the .catch chains in message handlers able
+   * to surface a meaningful message to the UI.
+   */
+  function parseBoundedJson(responseText) {
+    try {
+      return JSON.parse(responseText.trimStart());
+    } catch (error) {
+      const wrapped = new Error(
+        "AI provider returned malformed JSON: " + error.message,
+      );
+      wrapped.code = "AI_RESPONSE_MALFORMED_JSON";
+      throw wrapped;
+    }
   }
 
   // Some fetch implementations do not expose a readable stream. Preserve a
@@ -215,7 +233,7 @@ async function readBoundedAiResponse(response, onActivity) {
       error.code = "AI_RESPONSE_TOO_LARGE";
       throw error;
     }
-    return JSON.parse(responseText.trimStart());
+    return parseBoundedJson(responseText);
   }
 
   // Legacy/test fetch shims may expose only json(). The hard and idle timers
@@ -281,7 +299,7 @@ async function closePanelForTab(tabId, windowId) {
     // This closes the tab-specific panel used by YouTube Digest.
     await chrome.sidePanel.close({ tabId });
     return;
-  } catch (error) {
+  } catch {
     // Chrome 145+ rejects tabId when the visible instance is global. Close
     // that instance by window instead.
   }
@@ -334,7 +352,7 @@ chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
   try {
     const tab = await chrome.tabs.get(tabId);
     void updatePanelForTab(tabId, tab.url || tab.pendingUrl, windowId);
-  } catch (e) {
+  } catch {
     // Tab vanished before we could read it — nothing to do.
   }
 });
@@ -408,6 +426,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "deleteNote") {
     // Delete a specific note
     handleDeleteNote(message.noteId)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (message.action === "saveVocabEntry") {
+    handleSaveVocabEntry(message.entry)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+  if (message.action === "getVocabEntries") {
+    handleGetVocabEntries(message.videoId)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+  if (message.action === "updateVocabEntry") {
+    handleUpdateVocabEntry(message.id, message.patch)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+  if (message.action === "deleteVocabEntry") {
+    handleDeleteVocabEntry(message.id)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+  if (message.action === "lookupVocabMeaning") {
+    handleLookupVocabMeaning(message.text, message.contextEn, message.videoTitle)
       .then(sendResponse)
       .catch((err) => sendResponse({ success: false, error: err.message }));
     return true;
@@ -611,7 +660,7 @@ async function getPlayerVideoDetails(tabId) {
             description: details.shortDescription || "",
             duration: Number(details.lengthSeconds) || 0,
           };
-        } catch (e) {
+        } catch {
           return null;
         }
       },
@@ -885,7 +934,7 @@ function parseLooseJson(text) {
 
   try {
     return JSON.parse(cleaned);
-  } catch (firstError) {
+  } catch {
     // Most common LLM slip: a trailing comma right before a } or ].
     // e.g. ["a", "b", ]  ->  ["a", "b" ]
     const repaired = cleaned.replace(/,(\s*[}\]])/g, "$1");
@@ -1107,7 +1156,7 @@ async function handleGetVideoInfo(tabId) {
       action: "getVideoInfo",
     });
     return response;
-  } catch (error) {
+  } catch {
     return { title: "", channelName: "", description: "" };
   }
 }
@@ -1186,7 +1235,7 @@ async function handleSaveNote(
         transcript = cached[`digest_${videoId}`].transcript;
         debugLog("[YouTube Digest] Using cached transcript for note");
       }
-    } catch (e) {
+    } catch {
       debugLog("[YouTube Digest] No cached transcript, fetching...");
     }
 
@@ -1438,6 +1487,94 @@ async function handleDeleteNote(noteId) {
     await chrome.storage.local.set({ ytd_notes: notes });
     return { success: true };
   } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Vocabulary notebook — mirrors the notes storage pattern, delegating
+ * pure save/update/delete semantics to YTD_VOCAB.
+ */
+async function handleSaveVocabEntry(entry) {
+  const result = await chrome.storage.local.get("ytd_vocab");
+  const outcome = YTD_VOCAB.applyVocabSave(result.ytd_vocab || [], entry);
+  await chrome.storage.local.set({ ytd_vocab: outcome.entries });
+  return {
+    success: true,
+    status: outcome.status,
+    duplicateId: outcome.duplicateId || null,
+    entry: outcome.entry || null,
+  };
+}
+
+async function handleGetVocabEntries(videoId) {
+  const result = await chrome.storage.local.get("ytd_vocab");
+  let entries = result.ytd_vocab || [];
+  if (videoId) entries = entries.filter((e) => e && e.videoId === videoId);
+  return { success: true, entries };
+}
+
+async function handleUpdateVocabEntry(id, patch) {
+  const result = await chrome.storage.local.get("ytd_vocab");
+  const outcome = YTD_VOCAB.applyVocabUpdate(result.ytd_vocab || [], id, patch);
+  await chrome.storage.local.set({ ytd_vocab: outcome.entries });
+  return { success: outcome.updated };
+}
+
+async function handleDeleteVocabEntry(id) {
+  const result = await chrome.storage.local.get("ytd_vocab");
+  const outcome = YTD_VOCAB.applyVocabDelete(result.ytd_vocab || [], id);
+  await chrome.storage.local.set({ ytd_vocab: outcome.entries });
+  return { success: outcome.removed };
+}
+
+/**
+ * Dictionary-style meaning for a selection. One bounded, non-thinking
+ * JSON call — the cheapest AI touchpoint in the extension.
+ */
+async function handleLookupVocabMeaning(text, contextEn, videoTitle) {
+  try {
+    const settings = await getSettings();
+    if (!settings.aiApiKey) {
+      return {
+        success: false,
+        error: "NO_AI_KEY",
+        message: "DeepSeek API key not configured.",
+      };
+    }
+    const variables = {
+      videoTitle: videoTitle || "Unknown",
+      selectedText: String(text || "").trim(),
+      transcriptContext: contextEn || "None",
+    };
+    const systemPrompt = await loadPromptSection(
+      "vocab-lookup.md",
+      "System prompt",
+      variables,
+    );
+    const userPrompt = await loadPromptSection(
+      "vocab-lookup.md",
+      "User prompt",
+      variables,
+    );
+    debugLog("[YouTube Digest] Requesting vocab lookup");
+    const { text: raw } = await requestAiCompletion({
+      maxTokens: 300,
+      responseFormat: { type: "json_object" },
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+    });
+    const parsed = JSON.parse(raw);
+    const meaning =
+      parsed && typeof parsed.meaning === "string"
+        ? parsed.meaning.trim()
+        : "";
+    if (!meaning) return { success: false, error: "EMPTY_MEANING" };
+    return { success: true, meaning: meaning };
+  } catch (error) {
+    console.error("Vocab lookup error:", error);
     return { success: false, error: error.message };
   }
 }

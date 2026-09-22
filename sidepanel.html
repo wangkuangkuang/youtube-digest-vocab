@@ -66,6 +66,7 @@
         <button class="tab active" data-tab="transcript">Transcript</button>
         <button class="tab" data-tab="overview">Overview</button>
         <button class="tab" data-tab="notes">Notes</button>
+        <button class="tab" data-tab="vocab">单词本</button>
       </div>
     </div>
 
@@ -250,6 +251,42 @@
             <div id="notesList"></div>
           </div>
         </div>
+
+        <!-- TAB: 单词本 (vocab notebook) -->
+        <div class="tab-panel" data-panel="vocab">
+          <div class="section">
+            <div class="section-header vocab-section-header">
+              <div class="section-title">
+                单词本 <span class="vocab-count" id="vocabCount"></span>
+              </div>
+              <div class="vocab-tools">
+                <button class="enhance-btn" id="vocabQuizBtn" type="button">
+                  自测
+                </button>
+                <button class="enhance-btn" id="vocabExportCsvBtn" type="button">
+                  CSV
+                </button>
+                <button class="enhance-btn" id="vocabExportAnkiBtn" type="button">
+                  Anki
+                </button>
+              </div>
+            </div>
+            <div class="vocab-filters" role="group" aria-label="单词本筛选">
+              <button class="enhance-btn active" data-vocab-mastery="all" type="button">全部</button>
+              <button class="enhance-btn" data-vocab-mastery="new" type="button">未掌握</button>
+              <button class="enhance-btn" data-vocab-mastery="fuzzy" type="button">模糊</button>
+              <button class="enhance-btn" data-vocab-mastery="known" type="button">已掌握</button>
+              <span class="vocab-filter-sep" aria-hidden="true"></span>
+              <button class="enhance-btn active" id="vocabFilterAll" type="button" aria-pressed="true">全部</button>
+              <button class="enhance-btn" id="vocabFilterThis" type="button" aria-pressed="false">本视频</button>
+            </div>
+            <p class="notes-intro" id="vocabIntro">
+              在字幕中选中单词、短语或句子，点“收藏到单词本”即可保存。
+            </p>
+            <div id="vocabQuiz" class="vocab-quiz" hidden></div>
+            <div id="vocabList"></div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -263,6 +300,7 @@
     </button>
 
     <script src="settings.js"></script>
+    <script src="vocab.js"></script>
     <script src="sidepanel.js"></script>
   </body>
 </html>

@@ -2,10 +2,14 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
+> **This is a personal remix** of [zarazhangrui/youtube-digest](https://github.com/zarazhangrui/youtube-digest) (upstream v1.2.0), customized for English learning. It keeps the full upstream feature set: transcripts, bilingual translation, AI overviews, explanations, and timestamped notes. It adds a **vocabulary notebook (单词本)**: select any word, phrase, or sentence for an AI dictionary card, save it with bilingual context and timestamp, review with mastery levels (未掌握/模糊/已掌握), see saved words re-highlighted in new transcripts, drill with cloze quizzes, and export to CSV/Anki. MIT licensed, same bring-your-own-key model.
+
 Turn every YouTube video into a resource for deep learning. YouTube Digest brings transcripts, bilingual translation, AI overviews, explanations, and timestamped notes into one Chrome side panel, so you can study ideas and language without losing your place.
 
 - Turn captions into a readable, searchable learning resource.
 - Learn languages with the original transcript, a Simplified Chinese translation, or an aligned bilingual view.
+- Build a personal vocabulary notebook: select any word, phrase, or sentence to see its meaning, then save it with the bilingual context and video timestamp.
+- Review vocabulary with mastery levels, re-appearance highlights in new transcripts, listen-back, pronunciation, CSV/Anki export, and cloze quizzes.
 - Build understanding with an AI overview, chapters, key quotes, and selected-text explanations.
 - Navigate long videos by clicking timestamps in the transcript, overview, or notes.
 - Save polished timestamped notes for later study.
@@ -104,7 +108,9 @@ Keys and settings are stored in Chrome's local extension storage on your device.
 3. Read the timestamped transcript, or choose **Original**, **中文**, or **双语**.
 4. Open **Overview** when you want AI-generated chapters and key quotes.
 5. Select transcript text when you want an AI explanation.
-6. Save a note from the player or a key quote, then revisit it from **Notes**.
+6. Select a word, phrase, or sentence to open the dictionary card, then choose **收藏到单词本** to save it with its bilingual context.
+7. Review saved vocabulary in **单词本**: set mastery, jump back to the source sentence, listen again, hear it spoken, run **自测** cloze drills, or export to CSV and Anki.
+8. Save a note from the player or a key quote, then revisit it from **Notes**.
 
 ## What works today
 
@@ -113,6 +119,7 @@ Keys and settings are stored in Chrome's local extension storage on your device.
 - Native subtitle tracks returned by Supadata. YouTube Digest prefers English when available, but may show another native language.
 - Original, Simplified Chinese, and aligned bilingual transcript views.
 - AI overviews, selected-text explanations, translation, and automatic note polishing.
+- Vocabulary notebook: selection dictionary lookups, saved entries with bilingual context and timestamps, mastery tracking, re-appearance highlighting, listen-back, pronunciation, CSV/Anki export, and cloze self-testing.
 - Local notes and a local cache for recent transcript and digest results.
 - DeepSeek V4 Flash for all published AI features. Other providers require a local code adaptation and are not supported by this published version.
 
@@ -161,7 +168,7 @@ YouTube Digest uses plain HTML, CSS, and JavaScript with no build step, so it is
 
 - Add more translation languages and let each person choose a learning language.
 - Create customized summary templates for lectures, interviews, tutorials, reviews, or research talks.
-- Build a vocabulary notebook that saves a word, its sentence, meaning, and video timestamp.
+- Extend the vocabulary notebook with spaced-repetition scheduling or word-form matching.
 - Export notes and vocabulary to Markdown, CSV, Anki, or another study tool.
 - Add personal topic filters that highlight the chapters most relevant to a goal.
 - Add optional local-model support for a different privacy and cost tradeoff.
