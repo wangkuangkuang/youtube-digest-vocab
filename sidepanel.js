@@ -1108,6 +1108,9 @@ function renderTranscript() {
   // Reapply an active query after a language mode rerenders the transcript.
   refreshTranscriptSearch({ preserveIndex: false, scroll: false });
 
+  // Saved vocab words reappear highlighted after any mode rerender.
+  refreshVocabHighlights();
+
   // Start tracking video playback for auto-scroll
   startPlaybackTracking();
 }
@@ -1905,6 +1908,101 @@ function setVocabScope(scope) {
   allBtn?.setAttribute("aria-pressed", String(isAll));
   thisBtn?.classList.toggle("active", !isAll);
   thisBtn?.setAttribute("aria-pressed", String(!isAll));
+}
+
+// ============================================================
+// VOCAB RE-APPEARANCE HIGHLIGHT ENGINE
+// ============================================================
+
+let vocabHighlightIndex = null;
+let vocabHighlightKnown = false; // future setting hook; default off
+
+function refreshVocabHighlightIndex() {
+  vocabHighlightIndex = YTD_VOCAB.buildVocabIndex(currentVocabEntries, {
+    highlightKnown: vocabHighlightKnown,
+  });
+}
+
+function clearVocabHighlights(root) {
+  (root || document)
+    .querySelectorAll("mark.vocab-highlight")
+    .forEach((mark) => {
+      const parent = mark.parentNode;
+      if (!parent) return;
+      parent.replaceChild(
+        document.createTextNode(mark.textContent || ""),
+        mark,
+      );
+      parent.normalize();
+    });
+}
+
+function applyVocabHighlights(rootEl) {
+  const root = rootEl || document.getElementById("transcriptList");
+  if (!root || !vocabHighlightIndex) return;
+  const wordsEmpty =
+    !vocabHighlightIndex.words.en.size &&
+    !vocabHighlightIndex.words.zh.size;
+  const phrasesEmpty =
+    !vocabHighlightIndex.phrases.en.length &&
+    !vocabHighlightIndex.phrases.zh.length;
+  if (wordsEmpty && phrasesEmpty) return;
+
+  root
+    .querySelectorAll(".transcript-original, .transcript-translation")
+    .forEach((span) => {
+      const language = span.classList.contains("transcript-original")
+        ? "en"
+        : "zh";
+      const walker = document.createTreeWalker(span, NodeFilter.SHOW_TEXT, {
+        acceptNode: (node) =>
+          node.parentNode && node.parentNode.closest("mark")
+            ? NodeFilter.FILTER_REJECT
+            : NodeFilter.FILTER_ACCEPT,
+      });
+      const textNodes = [];
+      let node;
+      while ((node = walker.nextNode())) textNodes.push(node);
+
+      textNodes.forEach((textNode) => {
+        const matches = YTD_VOCAB.findVocabMatches(
+          textNode.nodeValue,
+          vocabHighlightIndex,
+          language,
+        );
+        if (!matches.length) return;
+        const fragment = document.createDocumentFragment();
+        let cursor = 0;
+        matches.forEach(({ start, end, entryId }) => {
+          if (start > cursor) {
+            fragment.appendChild(
+              document.createTextNode(textNode.nodeValue.slice(cursor, start)),
+            );
+          }
+          const mark = document.createElement("mark");
+          mark.className = "vocab-highlight";
+          mark.dataset.vocabId = entryId;
+          mark.title = "已收藏";
+          mark.textContent = textNode.nodeValue.slice(start, end);
+          fragment.appendChild(mark);
+          cursor = end;
+        });
+        if (cursor < textNode.nodeValue.length) {
+          fragment.appendChild(
+            document.createTextNode(textNode.nodeValue.slice(cursor)),
+          );
+        }
+        textNode.parentNode.replaceChild(fragment, textNode);
+      });
+    });
+}
+
+function refreshVocabHighlights() {
+  if (!vocabHighlightIndex) refreshVocabHighlightIndex();
+  const list = document.getElementById("transcriptList");
+  if (!list) return;
+  clearVocabHighlights(list);
+  applyVocabHighlights(list);
 }
 
 // ============================================================
@@ -3108,6 +3206,8 @@ function renderTranscriptModeRows(segments, mode) {
   // Bilingual mode can find source text before each translation arrives.
   refreshTranscriptSearch({ preserveIndex: false, scroll: false });
 
+  refreshVocabHighlights();
+
   startPlaybackTracking();
   return rows;
 }
@@ -3177,6 +3277,9 @@ function updateTranslatedRow(segment, index, alignedItem, generation) {
       retryTranslationSegment(index, generation);
     });
   }
+
+  // The rerendered row lost its vocab marks — reapply them.
+  applyVocabHighlights(row);
 }
 
 let activeTranslationQueue = null;

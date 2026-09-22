@@ -79,3 +79,16 @@ test("vocab list renders mastery cycle, listen-back, delete", () => {
   assert.match(panel, /function playVocabEntry\(/);
   assert.match(panel, /switchTab\("transcript"\)/);
 });
+
+test("highlight engine walks text nodes but skips any mark, and never unwraps search marks", () => {
+  assert.match(panel, /function applyVocabHighlights\(/);
+  assert.match(panel, /closest\("mark"\)/);
+  assert.match(panel, /mark\.vocab-highlight/);
+  const clearFn = panel.match(/function clearVocabHighlights\([\s\S]*?\n\}/)?.[0] || "";
+  assert.equal(clearFn.includes("transcript-search-highlight"), false);
+});
+
+test("render pipeline re-applies vocab highlights", () => {
+  assert.match(panel, /refreshTranscriptSearch\(\{ preserveIndex: false, scroll: false \}\);\s*\n\s*refreshVocabHighlights\(\);/);
+  assert.match(panel, /function updateTranslatedRow[\s\S]*?applyVocabHighlights\(row\);/);
+});
