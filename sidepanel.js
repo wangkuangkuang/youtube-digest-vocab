@@ -2478,7 +2478,13 @@ function setupExplainFeature() {
         // one frame before moving it to the selection center.
         const rect = range.getBoundingClientRect();
         tooltip.style.top = `${rect.bottom + window.scrollY + 8}px`;
-        tooltip.style.left = `${rect.left + rect.width / 2}px`;
+        // Clamp the card center so the card never spills past the panel edge
+        // when the selection sits near the left or right side.
+        const cardWidth = Math.min(340, window.innerWidth - 20);
+        let centerX = rect.left + rect.width / 2;
+        centerX = Math.min(centerX, window.innerWidth - cardWidth / 2 - 10);
+        centerX = Math.max(cardWidth / 2 + 10, centerX);
+        tooltip.style.left = `${centerX}px`;
         tooltip.style.display = "flex";
 
         const termEl = tooltip.querySelector(".selection-term");

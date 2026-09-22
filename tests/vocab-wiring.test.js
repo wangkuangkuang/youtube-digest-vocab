@@ -139,6 +139,16 @@ test("speak picks the best available voice per language", () => {
   assert.match(panel, /YTD_VOCAB\.pickBestVoice\(/);
 });
 
+test("selection card is clamped inside the panel viewport", () => {
+  assert.match(panel, /const cardWidth = Math\.min\(340, window\.innerWidth - 20\);/);
+  assert.match(panel, /Math\.min\(centerX, window\.innerWidth - cardWidth \/ 2 - 10\)/);
+  assert.match(panel, /Math\.max\(cardWidth \/ 2 \+ 10, /);
+});
+
+test("term and meaning are separated by a divider line", () => {
+  assert.match(css, /\.explain-tooltip \.selection-term\s*\{[\s\S]*?border-bottom: 1px solid/);
+});
+
 test("original-mode transcript markup is highlighted and captured", () => {
   assert.match(panel, /\.querySelectorAll\("\.transcript-text, \.transcript-original, \.transcript-translation"\)/);
   assert.match(panel, /row\?\.querySelector\("\.transcript-original"\)\?\.textContent\?\.trim\(\)\s*\|\|\s*row\?\.querySelector\("\.transcript-text"\)/);

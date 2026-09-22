@@ -1530,13 +1530,14 @@ mark.vocab-highlight {
   line-height: 1.5;
   white-space: normal;
   overflow-wrap: anywhere;
-  padding: 10px 12px 0;
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--border, #ddd);
   user-select: text;
 }
 .explain-tooltip .selection-meaning {
   font-size: 12px;
   line-height: 1.5;
-  padding: 6px 12px 8px;
+  padding: 8px 12px 8px;
   white-space: normal;
   overflow-wrap: anywhere;
   color: var(--text-muted, #666);
