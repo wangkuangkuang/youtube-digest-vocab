@@ -269,7 +269,86 @@ var YTD_VOCAB = (() => {
     });
   }
 
-  // (export functions are appended in Task 3)
+  function vocabVideoUrl(entry) {
+    const t = Math.max(0, Math.floor(Number(entry && entry.timestampSeconds) || 0));
+    return "https://youtu.be/" + (entry && entry.videoId) + "?t=" + t;
+  }
+
+  function csvEscape(value) {
+    const s = String(value === undefined || value === null ? "" : value);
+    if (!/[",\n\r]/.test(s)) return s;
+    // Flatten newlines so each record stays on one physical line (naive
+    // CSV consumers split on \n); quoting is still decided by the raw value.
+    return '"' + s.replace(/[\n\r]/g, " ").replace(/"/g, '""') + '"';
+  }
+
+  function toCsv(entries) {
+    const header = "term,language,meaning,contextEn,contextZh,videoTitle,videoUrl,timestampSeconds,mastery,createdAt";
+    const lines = [header];
+    (entries || []).forEach((e) => {
+      const fields = [
+        e.text,
+        e.language,
+        e.meaning,
+        e.contextEn,
+        e.contextZh,
+        e.videoTitle,
+        vocabVideoUrl(e),
+        String(e.timestampSeconds),
+        e.mastery,
+        new Date(e.createdAt).toISOString(),
+      ];
+      lines.push(fields.map(csvEscape).join(","));
+    });
+    return lines.join("\n");
+  }
+
+  function ankiField(value) {
+    return String(value === undefined || value === null ? "" : value)
+      .replace(/[\t\n\r]/g, " ")
+      .trim();
+  }
+
+  function locateTermInSentence(sentence, term) {
+    if (!term || !sentence) return null;
+    const lower = sentence.toLowerCase();
+    const exact = lower.indexOf(term.toLowerCase());
+    if (exact !== -1) return { index: exact, length: term.length };
+    // Loose fallback: the saved term may carry quotes the sentence lacks
+    // (e.g. term `run, "fast"` vs sentence `run, fast`).
+    const loose = term.replace(/["“”「」『』]/g, "").replace(/\s+/g, " ").trim();
+    if (!loose) return null;
+    const looseIdx = lower.indexOf(loose.toLowerCase());
+    return looseIdx === -1 ? null : { index: looseIdx, length: loose.length };
+  }
+
+  function toAnkiTsv(entries) {
+    return (entries || [])
+      .map((e) => {
+        const sentence = ankiField(e.contextEn);
+        const term = ankiField(e.text);
+        let bolded = sentence;
+        if (term && sentence) {
+          const located = locateTermInSentence(sentence, term);
+          if (located) {
+            const end = located.index + located.length;
+            bolded =
+              sentence.slice(0, located.index) +
+              "<b>" +
+              sentence.slice(located.index, end) +
+              "</b>" +
+              sentence.slice(end);
+          }
+        }
+        const front = ankiField(e.text) + "<br>" + bolded;
+        const back =
+          ankiField(e.meaning || e.contextZh) +
+          "<br>source: " +
+          ankiField(e.videoTitle);
+        return front + "\t" + back;
+      })
+      .join("\n");
+  }
 
   return {
     MASTERY_LEVELS,
@@ -290,6 +369,9 @@ var YTD_VOCAB = (() => {
     resolveMeaningSource,
     blankFirstOccurrence,
     generateClozeQuestions,
+    vocabVideoUrl,
+    toCsv,
+    toAnkiTsv,
   };
 })();
 
