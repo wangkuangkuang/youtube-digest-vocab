@@ -156,7 +156,120 @@ var YTD_VOCAB = (() => {
     return kept;
   }
 
-  // (storage / cloze / export functions are appended in Tasks 2-3)
+  function dedupeExisting(entries, text, language) {
+    const key = normalizeWhitespace(text).toLowerCase();
+    const lang = language === "zh" ? "zh" : "en";
+    const found = (entries || []).find(
+      (e) =>
+        e &&
+        e.language === lang &&
+        normalizeWhitespace(e.text).toLowerCase() === key,
+    );
+    return found ? found.id : null;
+  }
+
+  function applyVocabSave(entries, rawEntry) {
+    const entry = normalizeVocabEntry(rawEntry);
+    const duplicateId = dedupeExisting(entries, entry.text, entry.language);
+    if (duplicateId) {
+      return { entries: entries || [], status: "duplicate", duplicateId: duplicateId };
+    }
+    const next = [entry].concat(entries || []);
+    // Cap by dropping the oldest entry (min createdAt), not by position:
+    // callers may hand us entries in any order.
+    while (next.length > ENTRY_CAP) {
+      let oldestIdx = 1;
+      for (let i = 1; i < next.length; i++) {
+        if ((next[i].createdAt || 0) < (next[oldestIdx].createdAt || 0)) {
+          oldestIdx = i;
+        }
+      }
+      next.splice(oldestIdx, 1);
+    }
+    return { entries: next, status: "saved", entry: entry };
+  }
+
+  function applyVocabUpdate(entries, id, patch) {
+    let updated = false;
+    const next = (entries || []).map((entry) => {
+      if (!entry || entry.id !== id) return entry;
+      updated = true;
+      const merged = Object.assign({}, entry);
+      if (patch && MASTERY_LEVELS.includes(patch.mastery)) {
+        merged.mastery = patch.mastery;
+      }
+      if (patch && typeof patch.meaning === "string") {
+        merged.meaning = patch.meaning.trim();
+      }
+      return merged;
+    });
+    return { entries: next, updated: updated };
+  }
+
+  function applyVocabDelete(entries, id) {
+    const next = (entries || []).filter((e) => e && e.id !== id);
+    return { entries: next, removed: next.length !== (entries || []).length };
+  }
+
+  function resolveMeaningSource(selectionText, rowEnText, rowZhText) {
+    const selection = normalizeWhitespace(selectionText).toLowerCase();
+    const rowEn = normalizeWhitespace(rowEnText).toLowerCase();
+    const zh = String(rowZhText || "").trim();
+    if (!selection || !rowEn || !zh) return "ai";
+    if (!rowEn.includes(selection) && !selection.includes(rowEn)) return "ai";
+    return selection.length >= Math.floor(rowEn.length * 0.9)
+      ? "cache"
+      : "ai";
+  }
+
+  function mulberry32(seed) {
+    let a = seed >>> 0;
+    return function () {
+      a |= 0;
+      a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function blankFirstOccurrence(sentence, term) {
+    const s = normalizeWhitespace(sentence);
+    const t = normalizeWhitespace(term);
+    if (!s || !t) return null;
+    const idx = s.toLowerCase().indexOf(t.toLowerCase());
+    if (idx === -1) return null;
+    return s.slice(0, idx) + CLOZE_BLANK + s.slice(idx + t.length);
+  }
+
+  function generateClozeQuestions(entries, count, seed) {
+    const limit = Math.max(0, Number.isFinite(count) ? count : 10);
+    const pool = (entries || []).filter((e) => e && e.text);
+    const priority = pool.filter((e) => e.mastery !== "known");
+    const candidates =
+      priority.length >= limit || priority.length === pool.length
+        ? priority
+        : priority.concat(pool.filter((e) => e.mastery === "known"));
+    const rand = mulberry32(Number.isFinite(seed) ? seed : 1);
+    const copy = candidates.slice();
+    for (let i = copy.length - 1; i > 0; i--) {
+      const j = Math.floor(rand() * (i + 1));
+      const tmp = copy[i];
+      copy[i] = copy[j];
+      copy[j] = tmp;
+    }
+    return copy.slice(0, limit).map((entry) => {
+      const prompt = blankFirstOccurrence(entry.contextEn, entry.text);
+      return {
+        entry: entry,
+        prompt: prompt,
+        hint: entry.meaning || entry.contextZh || "",
+        hasContext: prompt !== null,
+      };
+    });
+  }
+
+  // (export functions are appended in Task 3)
 
   return {
     MASTERY_LEVELS,
@@ -170,6 +283,13 @@ var YTD_VOCAB = (() => {
     shouldHighlightEntry,
     buildVocabIndex,
     findVocabMatches,
+    dedupeExisting,
+    applyVocabSave,
+    applyVocabUpdate,
+    applyVocabDelete,
+    resolveMeaningSource,
+    blankFirstOccurrence,
+    generateClozeQuestions,
   };
 })();
 
