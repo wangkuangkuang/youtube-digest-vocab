@@ -1898,6 +1898,15 @@ function setupVocabTabControls() {
   });
   // default scope: all
   setVocabScope("all");
+  document
+    .getElementById("vocabExportCsvBtn")
+    ?.addEventListener("click", exportVocabCsv);
+  document
+    .getElementById("vocabExportAnkiBtn")
+    ?.addEventListener("click", exportVocabAnki);
+  document
+    .getElementById("vocabQuizBtn")
+    ?.addEventListener("click", startVocabQuiz);
 }
 
 function setVocabScope(scope) {
@@ -2003,6 +2012,171 @@ function refreshVocabHighlights() {
   if (!list) return;
   clearVocabHighlights(list);
   applyVocabHighlights(list);
+}
+
+// ============================================================
+// VOCAB EXPORT + CLOZE QUIZ
+// ============================================================
+
+function downloadTextFile(filename, content, mime) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function vocabExportDate() {
+  return new Date().toISOString().slice(0, 10).replace(/-/g, "");
+}
+
+function exportVocabCsv() {
+  if (!currentVocabEntries.length) return;
+  downloadTextFile(
+    `youtube-digest-vocab-${vocabExportDate()}.csv`,
+    YTD_VOCAB.toCsv(currentVocabEntries),
+    "text/csv;charset=utf-8",
+  );
+}
+
+function exportVocabAnki() {
+  if (!currentVocabEntries.length) return;
+  downloadTextFile(
+    `youtube-digest-vocab-anki-${vocabExportDate()}.txt`,
+    YTD_VOCAB.toAnkiTsv(currentVocabEntries),
+    "text/plain;charset=utf-8",
+  );
+}
+
+let vocabQuizState = null;
+
+function startVocabQuiz() {
+  const pool = filteredVocabEntries();
+  if (!pool.length) return;
+  vocabQuizState = {
+    questions: YTD_VOCAB.generateClozeQuestions(
+      pool,
+      10,
+      Date.now() % 2147483647,
+    ),
+    index: 0,
+    results: { known: 0, fuzzy: 0, new: 0 },
+  };
+  renderVocabQuiz();
+}
+
+function exitVocabQuiz() {
+  vocabQuizState = null;
+  const quizEl = document.getElementById("vocabQuiz");
+  const listEl = document.getElementById("vocabList");
+  if (quizEl) {
+    quizEl.hidden = true;
+    quizEl.innerHTML = "";
+  }
+  if (listEl) listEl.style.display = "";
+  renderVocabList();
+}
+
+async function gradeVocabQuizQuestion(mastery) {
+  if (!vocabQuizState) return;
+  const question = vocabQuizState.questions[vocabQuizState.index];
+  vocabQuizState.results[mastery] = (vocabQuizState.results[mastery] || 0) + 1;
+  question.entry.mastery = mastery; // optimistic local
+  await chrome.runtime.sendMessage({
+    action: "updateVocabEntry",
+    id: question.entry.id,
+    patch: { mastery },
+  });
+  vocabQuizState.index += 1;
+  renderVocabQuiz();
+}
+
+function renderVocabQuiz() {
+  const quizEl = document.getElementById("vocabQuiz");
+  const listEl = document.getElementById("vocabList");
+  if (!quizEl) return;
+  if (!vocabQuizState) return;
+  quizEl.hidden = false;
+  if (listEl) listEl.style.display = "none";
+  quizEl.innerHTML = "";
+
+  const done = vocabQuizState.index >= vocabQuizState.questions.length;
+  const frame = document.createElement("div");
+  frame.className = "vocab-quiz-frame";
+
+  if (done) {
+    const { known, fuzzy, new: newCount } = vocabQuizState.results;
+    frame.innerHTML = `
+      <div class="vocab-quiz-title">自测完成</div>
+      <div class="vocab-quiz-score">认识 ${known} · 模糊 ${fuzzy} · 不认识 ${newCount}</div>
+      <div class="vocab-quiz-actions">
+        <button class="enhance-btn" type="button" id="vocabQuizAgain">再来一轮</button>
+        <button class="enhance-btn" type="button" id="vocabQuizExit">退出自测</button>
+      </div>
+    `;
+    quizEl.appendChild(frame);
+    frame.querySelector("#vocabQuizAgain").addEventListener("click", () => {
+      startVocabQuiz();
+    });
+    frame.querySelector("#vocabQuizExit").addEventListener("click", () => {
+      exitVocabQuiz();
+      refreshVocabHighlightIndex();
+      refreshVocabHighlights();
+    });
+    return;
+  }
+
+  const question = vocabQuizState.questions[vocabQuizState.index];
+  const total = vocabQuizState.questions.length;
+  const number = vocabQuizState.index + 1;
+
+  frame.innerHTML = `
+    <div class="vocab-quiz-progress">${number} / ${total}
+      <button class="vocab-quiz-cancel" type="button">退出</button>
+    </div>
+    <div class="vocab-quiz-prompt">${
+      question.hasContext
+        ? escapeHtml(question.prompt)
+        : `该词条暂无原句：${escapeHtml(question.entry.text)}`
+    }</div>
+    ${question.hint ? `<div class="vocab-quiz-hint">提示：${escapeHtml(question.hint)}</div>` : ""}
+    <div class="vocab-quiz-reveal" hidden>
+      <div class="vocab-quiz-answer">${escapeHtml(question.entry.text)}</div>
+      ${question.entry.contextEn ? `<div class="vocab-quiz-sentence">${escapeHtml(question.entry.contextEn)}</div>` : ""}
+    </div>
+    <div class="vocab-quiz-actions">
+      <button class="enhance-btn" type="button" id="vocabQuizReveal">显示答案</button>
+      <span class="vocab-quiz-grades" hidden>
+        <button class="vocab-mastery mastery-known" type="button">认识</button>
+        <button class="vocab-mastery mastery-fuzzy" type="button">模糊</button>
+        <button class="vocab-mastery mastery-new" type="button">不认识</button>
+      </span>
+    </div>
+  `;
+  quizEl.appendChild(frame);
+
+  const revealBox = frame.querySelector(".vocab-quiz-reveal");
+  const grades = frame.querySelector(".vocab-quiz-grades");
+  frame.querySelector("#vocabQuizReveal").addEventListener("click", () => {
+    revealBox.hidden = false;
+    grades.hidden = false;
+    frame.querySelector("#vocabQuizReveal").disabled = true;
+  });
+  frame.querySelector(".vocab-quiz-cancel").addEventListener("click", () => {
+    exitVocabQuiz();
+  });
+  grades
+    .querySelectorAll(".vocab-mastery")
+    .forEach((button) =>
+      button.addEventListener("click", () => {
+        const map = { 认识: "known", 模糊: "fuzzy", 不认识: "new" };
+        void gradeVocabQuizQuestion(map[button.textContent]);
+      }),
+    );
 }
 
 // ============================================================

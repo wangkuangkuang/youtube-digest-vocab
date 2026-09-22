@@ -92,3 +92,16 @@ test("render pipeline re-applies vocab highlights", () => {
   assert.match(panel, /refreshTranscriptSearch\(\{ preserveIndex: false, scroll: false \}\);\s*\n\s*refreshVocabHighlights\(\);/);
   assert.match(panel, /function updateTranslatedRow[\s\S]*?applyVocabHighlights\(row\);/);
 });
+
+test("export uses YTD_VOCAB serializers with blob download", () => {
+  assert.match(panel, /YTD_VOCAB\.toCsv\(/);
+  assert.match(panel, /YTD_VOCAB\.toAnkiTsv\(/);
+  assert.match(panel, /URL\.createObjectURL\(/);
+});
+
+test("quiz mode grades into mastery updates", () => {
+  assert.match(panel, /YTD_VOCAB\.generateClozeQuestions\(/);
+  assert.match(panel, /function startVocabQuiz\(/);
+  assert.match(panel, /显示答案/);
+  assert.match(panel, /认识/);
+});
