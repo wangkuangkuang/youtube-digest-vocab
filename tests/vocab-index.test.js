@@ -57,3 +57,26 @@ test("overlapping matches prefer the longer phrase", () => {
   const m = vocab.findVocabMatches("machine learning", idx, "en");
   assert.deepEqual(m.map((x) => x.entryId), ["p"]);
 });
+
+test("pickBestVoice prefers natural voices for the language", () => {
+  const voices = [
+    { name: "Compact Espeech", lang: "en-US", localService: true },
+    { name: "Google UK English Female", lang: "en-GB", localService: false },
+    { name: "Google US English", lang: "en-US", localService: false },
+    { name: "Microsoft Aria - English (United States)", lang: "en-US", localService: false },
+    { name: "Tingting", lang: "zh-CN", localService: true },
+  ];
+  assert.equal(vocab.pickBestVoice(voices, "en")?.name, "Google US English");
+  assert.equal(vocab.pickBestVoice(voices, "zh")?.name, "Tingting");
+});
+
+test("pickBestVoice penalizes compact robotic voices and ignores other languages", () => {
+  const voices = [
+    { name: "Compact Espeech", lang: "en-US", localService: true },
+    { name: "Samantha", lang: "en-US", localService: true },
+    { name: "Google 普通话（中国大陆）", lang: "zh-CN", localService: false },
+  ];
+  assert.equal(vocab.pickBestVoice(voices, "en")?.name, "Samantha");
+  assert.equal(vocab.pickBestVoice(voices, "zh")?.name, "Google 普通话（中国大陆）");
+  assert.equal(vocab.pickBestVoice([{ name: "French", lang: "fr-FR" }], "en"), null);
+});

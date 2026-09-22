@@ -30,6 +30,40 @@ var YTD_VOCAB = (() => {
     return normalized.length > 0 && !normalized.includes(" ");
   }
 
+  /**
+   * Picks the most natural speechSynthesis voice for a language.
+   * Tiers (cumulative score): exact locale match > language match (others
+   * are ignored); Google network voices and Natural/Enhanced/Neural system
+   * voices score highest; well-known platform voices score mid; compact /
+   * espeak / pico robotic voices are penalized.
+   */
+  function pickBestVoice(voices, language) {
+    const primary = language === "zh" ? "zh-cn" : "en-us";
+    const wantPrefix = language === "zh" ? "zh" : "en";
+    let best = null;
+    let bestScore = -1;
+    (voices || []).forEach((voice) => {
+      if (!voice || !voice.lang) return;
+      const lang = String(voice.lang).replace("_", "-").toLowerCase();
+      let score = 0;
+      if (lang === primary) score += 40;
+      else if (lang.startsWith(wantPrefix)) score += 20;
+      else return; // other language — never pick
+      const name = String(voice.name || "").toLowerCase();
+      if (/google/.test(name)) score += 30;
+      if (/natural|neural|enhanced|premium/.test(name)) score += 25;
+      if (/samantha|tingting|aria|jenny|guy|sonia|libby|mei-?jia|yu-?shu/.test(name)) score += 15;
+      if (/compact|espeak|pico/.test(name)) score -= 20;
+      if (voice.localService) score += 5;
+      if (voice.default) score += 2;
+      if (score > bestScore) {
+        best = voice;
+        bestScore = score;
+      }
+    });
+    return best;
+  }
+
   function createEntryId() {
     if (typeof crypto !== "undefined" && crypto.randomUUID) {
       return crypto.randomUUID();
@@ -358,6 +392,7 @@ var YTD_VOCAB = (() => {
     normalizeWhitespace,
     hasCJK,
     isSingleWord,
+    pickBestVoice,
     normalizeVocabEntry,
     shouldHighlightEntry,
     buildVocabIndex,

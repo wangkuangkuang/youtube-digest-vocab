@@ -2191,12 +2191,24 @@ function renderVocabQuiz() {
 // TEXT SELECTION ACTIONS
 // ============================================================
 
+let vocabVoicesCache = null;
+
 function vocabSpeak(text, language) {
   if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
   const value = String(text || "").trim();
   if (!value) return;
+  if (!vocabVoicesCache) {
+    vocabVoicesCache = window.speechSynthesis.getVoices() || [];
+    window.speechSynthesis.addEventListener?.("voiceschanged", () => {
+      vocabVoicesCache = window.speechSynthesis.getVoices() || [];
+    });
+  }
   const utterance = new SpeechSynthesisUtterance(value);
   utterance.lang = language === "zh" ? "zh-CN" : "en-US";
+  const voice = YTD_VOCAB.pickBestVoice(vocabVoicesCache, language);
+  if (voice) utterance.voice = voice;
+  utterance.rate = 0.95;
+  utterance.pitch = 1;
   window.speechSynthesis.cancel();
   window.speechSynthesis.speak(utterance);
 }
@@ -2310,6 +2322,54 @@ function dismissSelectionActions(clearSelection = false) {
   if (clearSelection) window.getSelection()?.removeAllRanges();
 }
 
+/** Loading placeholder for the inline explanation area. */
+function buildExplainLoading() {
+  const wrapper = document.createElement("div");
+  wrapper.className = "explain-loading";
+  const bar = document.createElement("div");
+  bar.className = "loading-bar";
+  const label = document.createElement("span");
+  label.textContent = "解析中…";
+  wrapper.append(bar, label);
+  return wrapper;
+}
+
+/** Error line for a failed inline explanation. */
+function buildExplainError(message) {
+  const el = document.createElement("div");
+  el.className = "explain-error";
+  el.textContent = `解析失败：${message}`;
+  return el;
+}
+
+/**
+ * Renders the bilingual explanation into the inline box: the English part
+ * first, then the line that followed 中文：. Both stay selectable so words
+ * inside them can be looked up again.
+ */
+function renderInlineExplanation(box, raw) {
+  const parts = raw.split(/\n?\s*中文[:：]/);
+  const en = (parts[0] || "").trim();
+  const zh = (parts.length > 1 ? parts[1] || "" : "").trim();
+  const nodes = [];
+  if (en) {
+    const enDiv = document.createElement("div");
+    enDiv.className = "explain-text";
+    enDiv.textContent = en;
+    nodes.push(enDiv);
+  }
+  if (zh) {
+    const zhDiv = document.createElement("div");
+    zhDiv.className = "explain-zh";
+    zhDiv.textContent = zh;
+    nodes.push(zhDiv);
+  }
+  if (!nodes.length) {
+    nodes.push(buildExplainError("返回内容为空，请重试"));
+  }
+  box.replaceChildren(...nodes);
+}
+
 /**
  * Sets up text selection handling in the transcript.
  * When the user selects text, shows Explain and Note actions.
@@ -2335,16 +2395,15 @@ function setupExplainFeature() {
   tooltip.setAttribute("role", "toolbar");
   tooltip.setAttribute("aria-label", "Selected transcript actions");
   tooltip.innerHTML = `
-    <div class="selection-term-row">
-      <span class="selection-term"></span>
-      <button class="selection-speak-btn" type="button" title="朗读" aria-label="Read selection aloud">朗读</button>
-    </div>
+    <div class="selection-term"></div>
     <div class="selection-meaning"></div>
     <div class="selection-actions">
-      <button class="selection-save-btn" type="button">收藏到单词本</button>
+      <button class="selection-speak-btn" type="button" title="朗读" aria-label="Read selection aloud">朗读</button>
       <button class="explain-btn" type="button">Explain</button>
       <button class="selection-note-btn" type="button">Note</button>
+      <button class="selection-save-btn" type="button">收藏到单词本</button>
     </div>
+    <div class="selection-explain" hidden></div>
   `;
   tooltip.style.display = "none";
   document.body.appendChild(tooltip);
@@ -2356,14 +2415,26 @@ function setupExplainFeature() {
   let selectedRowZh = "";
   let lastLookup = null;
 
-  // Interacting with either action must preserve the transcript selection and
-  // stay isolated from document and row click behavior.
+  // Interacting with a button must preserve the transcript selection, but
+  // plain text inside the card (term, meaning, explanation) stays selectable
+  // so the user can look up words inside the explanation itself.
   tooltip.addEventListener("mousedown", (event) => {
-    event.preventDefault();
+    if (event.target.closest("button")) event.preventDefault();
     event.stopPropagation();
   });
   tooltip.addEventListener("mouseup", (event) => {
     event.stopPropagation();
+    const selection = window.getSelection();
+    const range = selection && selection.rangeCount ? selection.getRangeAt(0) : null;
+    const nestedText = selection?.toString().trim() || "";
+    if (
+      nestedText.length > 0 &&
+      nestedText.length <= 200 &&
+      range &&
+      tooltip.contains(range.startContainer)
+    ) {
+      showNestedExplainLookup(nestedText);
+    }
   });
   tooltip.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -2412,9 +2483,20 @@ function setupExplainFeature() {
 
         const termEl = tooltip.querySelector(".selection-term");
         const meaningEl = tooltip.querySelector(".selection-meaning");
-        const shownTerm = text.length > 60 ? text.slice(0, 60) + "…" : text;
-        termEl.textContent = shownTerm;
+        termEl.textContent = text;
         currentSelectionMeaning = "";
+
+        // A new selection invalidates any inline explanation and nested
+        // lookup from the previous one.
+        const explainBox = tooltip.querySelector(".selection-explain");
+        if (explainBox) {
+          explainBox.hidden = true;
+          explainBox.replaceChildren();
+          delete explainBox.dataset.loaded;
+        }
+        tooltip
+          .querySelectorAll(".selection-explain-subbox")
+          .forEach((el) => el.remove());
 
         if (
           YTD_VOCAB.resolveMeaningSource(text, selectedRowEn, selectedRowZh) ===
@@ -2477,7 +2559,9 @@ function setupExplainFeature() {
     { signal: selectionSignal },
   );
 
-  // Handle explain button click
+  // Handle explain button click — expand the explanation inline below the
+  // card instead of opening a modal, so the card keeps its position and the
+  // explanation text stays selectable for nested word lookups.
   tooltip
     .querySelector(".explain-btn")
     .addEventListener("click", async (event) => {
@@ -2485,8 +2569,30 @@ function setupExplainFeature() {
       event.stopPropagation();
       if (!selectedText) return;
 
-      tooltip.style.display = "none";
-      await showExplanation(selectedText);
+      const box = tooltip.querySelector(".selection-explain");
+      if (!box) return;
+      if (box.dataset.loaded === "1") {
+        box.hidden = !box.hidden;
+        return;
+      }
+      box.hidden = false;
+      box.replaceChildren(buildExplainLoading());
+      try {
+        const result = await chrome.runtime.sendMessage({
+          action: "explainSelection",
+          selectedText: selectedText,
+          transcriptContext: getTranscriptContext(selectedText),
+          videoTitle: currentVideoTitle,
+        });
+        if (result?.success) {
+          renderInlineExplanation(box, String(result.explanation || ""));
+          box.dataset.loaded = "1";
+        } else {
+          box.replaceChildren(buildExplainError(result?.error || "请稍后重试"));
+        }
+      } catch (error) {
+        box.replaceChildren(buildExplainError(error.message));
+      }
     });
 
   // Retry a failed meaning lookup on click.
@@ -2601,62 +2707,99 @@ function setupExplainFeature() {
 }
 
 /**
- * Shows the explanation modal and fetches it from the configured AI provider.
+ * Shows a nested mini lookup card at the bottom of the tooltip for text
+ * selected INSIDE the tooltip itself (e.g. a word in the explanation).
  */
-async function showExplanation(selectedText) {
-  // Create modal
-  const modal = document.createElement("div");
-  modal.id = "explainModal";
-  modal.className = "explain-modal-overlay";
-  modal.innerHTML = `
-    <div class="explain-modal">
-      <div class="explain-modal-header">
-        <div class="explain-modal-title">Explain</div>
-        <button class="explain-modal-close" id="closeExplain">Close</button>
-      </div>
-      <div class="explain-selected-text">"${escapeHtml(selectedText.substring(0, 200))}${selectedText.length > 200 ? "..." : ""}"</div>
-      <div class="explain-modal-content" id="explanationContent">
-        <div class="explain-loading">
-          <div class="loading-bar"></div>
-          <span>Analyzing...</span>
-        </div>
-      </div>
-    </div>
-  `;
-
-  document.body.appendChild(modal);
-
-  // Close handlers
-  document
-    .getElementById("closeExplain")
-    .addEventListener("click", () => modal.remove());
-  modal.addEventListener("click", (e) => {
-    if (e.target === modal) modal.remove();
-  });
-
-  // Get some context around the selection from the transcript
-  const transcriptContext = getTranscriptContext(selectedText);
-
-  // Fetch explanation
-  try {
-    const result = await chrome.runtime.sendMessage({
-      action: "explainSelection",
-      selectedText: selectedText,
-      transcriptContext: transcriptContext,
-      videoTitle: currentVideoTitle,
-    });
-
-    const contentDiv = document.getElementById("explanationContent");
-    if (result.success) {
-      contentDiv.innerHTML = `<div class="explain-text">${escapeHtml(result.explanation).replace(/\n\n/g, "</p><p>").replace(/\n/g, "<br>")}</div>`;
-    } else {
-      contentDiv.innerHTML = `<div class="explain-error">Failed to get explanation: ${escapeHtml(result.error)}</div>`;
-    }
-  } catch (error) {
-    const contentDiv = document.getElementById("explanationContent");
-    contentDiv.innerHTML = `<div class="explain-error">Error: ${escapeHtml(error.message)}</div>`;
+function showNestedExplainLookup(text) {
+  let subbox = tooltip.querySelector(".selection-explain-subbox");
+  if (!subbox) {
+    subbox = document.createElement("div");
+    subbox.className = "selection-explain-subbox";
+    tooltip.appendChild(subbox);
   }
+  const language = YTD_VOCAB.hasCJK(text) ? "zh" : "en";
+  const termRow = document.createElement("div");
+  termRow.className = "selection-subbox-term";
+  termRow.textContent = text;
+  const meaningEl = document.createElement("div");
+  meaningEl.className = "selection-subbox-meaning";
+  meaningEl.textContent = "翻译中…";
+  const actions = document.createElement("div");
+  actions.className = "selection-subbox-actions";
+  const speakBtn = document.createElement("button");
+  speakBtn.type = "button";
+  speakBtn.textContent = "朗读";
+  speakBtn.addEventListener("click", (event) => {
+    event.stopPropagation();
+    vocabSpeak(text, language);
+  });
+  const saveBtn = document.createElement("button");
+  saveBtn.type = "button";
+  saveBtn.className = "selection-subbox-save-btn";
+  saveBtn.textContent = "收藏到单词本";
+  saveBtn.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    if (!currentVideoId) return;
+    const meaning = meaningEl.textContent || "";
+    if (!meaning || meaning === "翻译中…" || meaning === "释义获取失败") return;
+    saveBtn.disabled = true;
+    saveBtn.textContent = "保存中…";
+    try {
+      const result = await chrome.runtime.sendMessage({
+        action: "saveVocabEntry",
+        entry: {
+          text: text,
+          language: language,
+          meaning: meaning,
+          contextEn: "",
+          contextZh: "",
+          videoId: currentVideoId,
+          videoTitle: currentVideoTitle,
+          timestampSeconds: selectedTimestamp,
+        },
+      });
+      saveBtn.textContent = "保存失败";
+      if (result?.success) {
+        saveBtn.textContent = result.status === "duplicate" ? "已收藏" : "已保存";
+      }
+      if (result?.success && typeof loadVocabEntries === "function") {
+        await loadVocabEntries();
+      }
+      if (result?.success && typeof refreshVocabHighlights === "function") {
+        refreshVocabHighlights();
+      }
+    } catch {
+      saveBtn.textContent = "保存失败";
+    } finally {
+      setTimeout(() => {
+        saveBtn.textContent = "收藏到单词本";
+        saveBtn.disabled = false;
+      }, 1500);
+    }
+  });
+  actions.append(speakBtn, saveBtn);
+  subbox.replaceChildren(termRow, meaningEl, actions);
+
+  vocabLookupGeneration += 1;
+  const generation = vocabLookupGeneration;
+  chrome.runtime.sendMessage(
+    {
+      action: "lookupVocabMeaning",
+      text: text,
+      contextEn: "",
+      videoTitle: currentVideoTitle,
+    },
+    (result) => {
+      if (generation !== vocabLookupGeneration) return;
+      if (result && result.success) {
+        meaningEl.textContent = result.meaning;
+      } else {
+        meaningEl.textContent = "释义获取失败";
+      }
+    },
+  );
 }
+
 
 /**
  * Gets surrounding context from the transcript for the selected text.

@@ -6,6 +6,8 @@ const path = require("node:path");
 const bg = fs.readFileSync(path.resolve(__dirname, "..", "background.js"), "utf8");
 const panel = fs.readFileSync(path.resolve(__dirname, "..", "sidepanel.js"), "utf8");
 const html = fs.readFileSync(path.resolve(__dirname, "..", "sidepanel.html"), "utf8");
+const css = fs.readFileSync(path.resolve(__dirname, "..", "sidepanel.css"), "utf8");
+const explainPrompt = fs.readFileSync(path.resolve(__dirname, "..", "prompts", "explain.md"), "utf8");
 
 test("background loads the vocab module via importScripts", () => {
   assert.match(bg, /importScripts\("vocab\.js"\);/);
@@ -104,6 +106,37 @@ test("quiz mode grades into mastery updates", () => {
   assert.match(panel, /function startVocabQuiz\(/);
   assert.match(panel, /显示答案/);
   assert.match(panel, /认识/);
+});
+
+test("selection card stacks vertically and shows the full term", () => {
+  assert.match(css, /\.explain-tooltip\s*\{[\s\S]*?flex-direction:\s*column/);
+  assert.doesNotMatch(panel, /text\.slice\(0, 60\)/); // no mid-term truncation
+  assert.match(css, /\.selection-term\s*\{[\s\S]*?white-space:\s*normal/);
+});
+
+test("all four selection actions sit in one row after the meaning", () => {
+  const actions = panel.match(/<div class="selection-actions">[\s\S]*?<\/div>/);
+  assert.ok(actions, "selection-actions row exists");
+  const row = actions[0];
+  ["selection-speak-btn", "explain-btn", "selection-note-btn", "selection-save-btn"].forEach(
+    (cls) => assert.ok(row.includes(cls), cls + " inside the actions row"),
+  );
+});
+
+test("explain expands inline below the card with bilingual output, no modal", () => {
+  assert.doesNotMatch(panel, /explainModal/);
+  assert.match(panel, /selection-explain/);
+  assert.match(panel, /中文/); // client-side split marker
+  assert.match(explainPrompt, /中文/); // prompt asks for the Chinese line
+});
+
+test("selecting text inside the explanation opens a nested lookup", () => {
+  assert.match(panel, /selection-explain-subbox/);
+  assert.match(panel, /tooltip\.contains\(range\.startContainer\)/);
+});
+
+test("speak picks the best available voice per language", () => {
+  assert.match(panel, /YTD_VOCAB\.pickBestVoice\(/);
 });
 
 test("original-mode transcript markup is highlighted and captured", () => {

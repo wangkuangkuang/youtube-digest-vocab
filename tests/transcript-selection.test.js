@@ -44,7 +44,8 @@ test("the selection toolbar preserves selection and contains pointer events", ()
   );
   assert.match(
     source,
-    /tooltip\.addEventListener\("mousedown", \(event\) => \{\s+event\.preventDefault\(\);\s+event\.stopPropagation\(\);/,
+    /tooltip\.addEventListener\("mousedown", \(event\) => \{\s+if \(event\.target\.closest\("button"\)\) event\.preventDefault\(\);\s+event\.stopPropagation\(\);/,
+    "buttons preserve the transcript selection while card text stays selectable",
   );
   assert.match(
     source,
