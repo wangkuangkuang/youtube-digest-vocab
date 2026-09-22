@@ -2,6 +2,8 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
+> **This is a personal remix** of [zarazhangrui/youtube-digest](https://github.com/zarazhangrui/youtube-digest) (upstream v1.2.0), customized for English learning. It keeps the full upstream feature set: transcripts, bilingual translation, AI overviews, explanations, and timestamped notes. It adds a **vocabulary notebook (单词本)**: select any word, phrase, or sentence for an AI dictionary card, save it with bilingual context and timestamp, review with mastery levels (未掌握/模糊/已掌握), see saved words re-highlighted in new transcripts, drill with cloze quizzes, and export to CSV/Anki. MIT licensed, same bring-your-own-key model.
+
 Turn every YouTube video into a resource for deep learning. YouTube Digest brings transcripts, bilingual translation, AI overviews, explanations, and timestamped notes into one Chrome side panel, so you can study ideas and language without losing your place.
 
 - Turn captions into a readable, searchable learning resource.

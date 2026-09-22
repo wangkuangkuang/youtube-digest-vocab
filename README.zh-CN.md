@@ -2,6 +2,8 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
+> **本项目是基于 [zarazhangrui/youtube-digest](https://github.com/zarazhangrui/youtube-digest)（上游 v1.2.0）的个人二次开发版本**，面向英语学习场景定制。完整保留上游功能（字幕、双语翻译、AI 概览、内容讲解、时间戳笔记），并新增 **单词本（Vocabulary Notebook）**：划词/短语/整句查询 AI 词典卡片，连同步双语原句和时间戳一键收藏；掌握度三档（未掌握/模糊/已掌握）；新视频字幕中自动高亮已收藏词汇；挖空自测；CSV/Anki 导出。MIT 许可，同样采用自带 API Key 模式。
+
 把每个 YouTube 视频变成一份可以深入学习的资料。YouTube Digest 把字幕、双语翻译、AI 概览、内容讲解和时间戳笔记放进同一个 Chrome 侧边栏，让你可以持续学习视频中的知识和语言，同时不丢失原视频上下文。
 
 - 把零碎字幕变成清晰、可搜索的学习资料。

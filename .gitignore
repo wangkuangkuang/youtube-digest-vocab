@@ -12,6 +12,7 @@ explainer-video/
 .agents/
 .augment/
 .claude/
+.superpowers/
 skills/
 skills-lock.json
 .playwright-mcp/
