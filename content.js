@@ -18,6 +18,13 @@ const debugLog = (...args) => {
   if (DEBUG) console.log(...args);
 };
 
+// Playback-speed bounds. Declared up here because init() reads the stored speed
+// synchronously, before the dictation helper section below has been evaluated.
+const YTD_PLAYBACK_RATE_KEY = "ytd_playback_rate";
+const YTD_MIN_PLAYBACK_RATE = 0.5;
+const YTD_MAX_PLAYBACK_RATE = 2;
+const YTD_DEFAULT_PLAYBACK_RATE = 1;
+
 // ============================================================
 // GLOBAL STATE
 // ============================================================
@@ -30,6 +37,16 @@ let ytdDigestButton = null;
 let digestButtonObserver = null;
 let digestButtonReconcileTimer = null;
 let digestButtonResizeListenerAdded = false;
+
+// Page-side dictation state (captions, playback speed, loop, URL watcher)
+let ytdCaptionsHidden = false;
+// null until this session claims a speed (restored or set by the panel), so a
+// navigation never stomps a speed the learner picked in YouTube's own menu.
+let ytdPlaybackRate = null;
+let ytdLoopState = null;
+let ytdLoopVideo = null;
+let ytdUrlWatchTimer = null;
+let ytdLastUrl = "";
 
 // ============================================================
 // INITIALIZATION
@@ -54,6 +71,11 @@ function init() {
   // (YouTube is an SPA, so elements appear/disappear as you navigate)
   setupButtonObserver();
   setupDigestButtonResizeListener();
+
+  // Restore the page-side study setup and keep it alive across navigation
+  restoreCaptionsHidden();
+  restorePlaybackRate();
+  startUrlWatcher();
 }
 
 /**
@@ -160,6 +182,55 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // Show brief feedback that note was saved
     showNoteSavedToast(message.note);
     sendResponse({ success: true });
+    return false;
+  }
+
+  if (message.action === "setCaptionsHidden") {
+    // Visually hide YouTube's captions; the player's own CC state is untouched
+    const hidden = applyCaptionsHidden(message.hidden);
+    persistCaptionsHidden(hidden);
+    sendResponse({ success: true, hidden });
+    return false;
+  }
+
+  if (message.action === "setLoop") {
+    // Start or clear a single-sentence replay range
+    const result = setLoop(message);
+    debugLog("[YouTube Digest Content] Loop now:", result.loop);
+    sendResponse(result);
+    return false;
+  }
+
+  if (message.action === "setPlaybackRate") {
+    // Dictation speed. Only the video element is touched; YouTube's own
+    // speed menu and its stored preference are left alone.
+    const rate = applyPlaybackRate(message.rate);
+    persistPlaybackRate(rate);
+    sendResponse({ success: true, rate });
+    return false;
+  }
+
+  if (message.action === "getPlayerState") {
+    // Snapshot of the player plus our page-side state
+    sendResponse(getPlayerState());
+    return false;
+  }
+
+  if (message.action === "playPause") {
+    // Toggle playback (used by the dictation controls)
+    sendResponse(togglePlayPause());
+    return false;
+  }
+
+  if (message.action === "getChapters") {
+    // Official chapters: panel list first, description text as fallback
+    const { chapters, source } = readChapters();
+    debugLog(
+      "[YouTube Digest Content] Chapters from",
+      source,
+      chapters.length,
+    );
+    sendResponse({ success: true, chapters, source });
     return false;
   }
 
@@ -784,6 +855,475 @@ function escapeHtmlForContent(text) {
   const div = document.createElement("div");
   div.textContent = text || "";
   return div.innerHTML;
+}
+
+// ============================================================
+// DICTATION PAGE HELPERS (CAPTIONS, PLAYBACK RATE, LOOP, CHAPTERS)
+// ============================================================
+
+const YTD_CAPTIONS_STYLE_ID = "ytd-captions-style";
+const YTD_LOOP_END_EPSILON = 0.05;
+
+/**
+ * Hide only the rendered caption boxes. The native CC button and the
+ * preference YouTube stores for it are deliberately left alone, so we never
+ * fight the player's own subtitle state.
+ */
+const YTD_CAPTIONS_CSS = `
+  .ytp-caption-window-container,
+  .ytp-caption-window-container .caption-window,
+  .ytp-caption-window-container .captions-text,
+  .caption-window,
+  .ytp-caption-segment,
+  .ytp-chrome-bottom .ytp-caption-window-container {
+    display: none !important;
+    visibility: hidden !important;
+    opacity: 0 !important;
+  }
+`;
+
+function getVideoElement() {
+  return document.querySelector("video.html5-main-video");
+}
+
+/**
+ * Applies the caption visibility state to the page and returns the state that
+ * is actually in effect. The injected style tag is the source of truth, so
+ * calling this again after navigation simply re-adds it if YouTube dropped it.
+ */
+function applyCaptionsHidden(hidden) {
+  const existingStyle = document.getElementById(YTD_CAPTIONS_STYLE_ID);
+
+  if (hidden) {
+    if (!existingStyle) {
+      const style = document.createElement("style");
+      style.id = YTD_CAPTIONS_STYLE_ID;
+      style.textContent = YTD_CAPTIONS_CSS;
+      (document.head || document.documentElement || document.body).appendChild(
+        style,
+      );
+    }
+  } else if (existingStyle) {
+    existingStyle.remove();
+  }
+
+  ytdCaptionsHidden = !!hidden;
+  debugLog("[YouTube Digest Content] Captions hidden:", ytdCaptionsHidden);
+  return ytdCaptionsHidden;
+}
+
+/**
+ * Persists the caption choice so a reload keeps the same study setup.
+ */
+function persistCaptionsHidden(hidden) {
+  try {
+    const result = chrome.storage.local.set({ ytd_captions_hidden: !!hidden });
+    if (result && typeof result.catch === "function") result.catch(() => {});
+  } catch (err) {
+    debugLog("[YouTube Digest Content] Could not persist captions:", err);
+  }
+}
+
+/**
+ * Restores the last caption choice on extension startup.
+ */
+function restoreCaptionsHidden() {
+  try {
+    const result = chrome.storage.local.get("ytd_captions_hidden");
+    if (!result || typeof result.then !== "function") return;
+
+    result
+      .then((data) => applyCaptionsHidden(!!data?.ytd_captions_hidden))
+      .catch((err) =>
+        debugLog("[YouTube Digest Content] Caption restore failed:", err),
+      );
+  } catch (err) {
+    debugLog("[YouTube Digest Content] Caption restore unavailable:", err);
+  }
+}
+
+/**
+ * Clamps a requested speed into [0.5, 2], the same bounds the side panel's
+ * gears stay inside. Missing, empty and non-numeric input means normal speed.
+ * Chrome's own pitch preservation (preservesPitch) is deliberately untouched,
+ * so only the tempo changes.
+ */
+function clampPlaybackRate(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === "" ||
+    typeof value === "boolean"
+  ) {
+    return YTD_DEFAULT_PLAYBACK_RATE;
+  }
+  const num = Number(value);
+  if (!Number.isFinite(num)) return YTD_DEFAULT_PLAYBACK_RATE;
+  return Math.min(Math.max(num, YTD_MIN_PLAYBACK_RATE), YTD_MAX_PLAYBACK_RATE);
+}
+
+/**
+ * Applies a speed to the player and returns the rate actually in effect. A
+ * missing video element (player still rendering) still records the choice, so
+ * the next navigation or metadata load applies it.
+ */
+function applyPlaybackRate(rate) {
+  const value = clampPlaybackRate(rate);
+  const video = getVideoElement();
+  if (video) video.playbackRate = value;
+  ytdPlaybackRate = value;
+  debugLog("[YouTube Digest Content] Playback rate:", ytdPlaybackRate);
+  return ytdPlaybackRate;
+}
+
+/**
+ * Persists the speed choice so a reload keeps the same study setup.
+ */
+function persistPlaybackRate(rate) {
+  try {
+    const result = chrome.storage.local.set({
+      [YTD_PLAYBACK_RATE_KEY]: clampPlaybackRate(rate),
+    });
+    if (result && typeof result.catch === "function") result.catch(() => {});
+  } catch (err) {
+    debugLog("[YouTube Digest Content] Could not persist playback rate:", err);
+  }
+}
+
+/**
+ * Restores the last speed on extension startup. Unlike the caption overlay, an
+ * absent setting changes nothing: forcing 1x on every reload would fight a
+ * speed the learner picked in YouTube's own menu.
+ */
+function restorePlaybackRate() {
+  try {
+    const result = chrome.storage.local.get(YTD_PLAYBACK_RATE_KEY);
+    if (!result || typeof result.then !== "function") return;
+
+    result
+      .then((data) => {
+        const stored = Number(data?.[YTD_PLAYBACK_RATE_KEY]);
+        // 0/NaN also covers null, undefined and the empty string.
+        if (!Number.isFinite(stored) || stored <= 0) return;
+        applyPlaybackRate(stored);
+        // YouTube renders the player after document_idle, so the apply above
+        // can run against a page that has no video element yet.
+        document.addEventListener(
+          "loadedmetadata",
+          reapplyPlaybackRate,
+          true,
+        );
+      })
+      .catch((err) =>
+        debugLog("[YouTube Digest Content] Playback rate restore failed:", err),
+      );
+  } catch (err) {
+    debugLog("[YouTube Digest Content] Playback rate restore unavailable:", err);
+  }
+}
+
+/**
+ * Re-applies the claimed speed once a source is loaded. Media events do not
+ * bubble, hence the capture flag on the listener registered above.
+ */
+function reapplyPlaybackRate() {
+  if (ytdPlaybackRate === null) return;
+  applyPlaybackRate(ytdPlaybackRate);
+}
+
+/**
+ * Clamps a timestamp into [0, max]. Non-finite values collapse to 0.
+ */
+function clampSeconds(value, max) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return 0;
+  return Math.min(Math.max(num, 0), max);
+}
+
+/**
+ * The loop end in seconds. A null end means "up to the video duration",
+ * resolved lazily so a loop set before metadata is loaded still works.
+ */
+function resolveLoopEnd() {
+  if (!ytdLoopState) return null;
+  if (ytdLoopState.end !== null) return ytdLoopState.end;
+
+  const video = getVideoElement();
+  if (!video || !Number.isFinite(video.duration)) return null;
+  return video.duration;
+}
+
+/**
+ * Plain snapshot of the active loop for the side panel (null when inactive).
+ */
+function describeLoop() {
+  if (!ytdLoopState) return null;
+
+  return {
+    start: ytdLoopState.start,
+    end: resolveLoopEnd(),
+    mode: ytdLoopState.mode,
+  };
+}
+
+/**
+ * Replays the segment once playback reaches its end. In "once" mode the video
+ * is paused and the loop is cleared, which is what a single-sentence repeat
+ * needs; "loop" keeps playing from the start indefinitely.
+ */
+function handleLoopTimeUpdate(event) {
+  if (!ytdLoopState) return;
+
+  const video = event?.currentTarget || getVideoElement();
+  if (!video) return;
+
+  const end = resolveLoopEnd();
+  // No usable end yet (metadata still loading) or an empty range: do nothing.
+  if (end === null || end <= ytdLoopState.start) return;
+  if (video.currentTime < end - YTD_LOOP_END_EPSILON) return;
+
+  const { start, mode } = ytdLoopState;
+  video.currentTime = start;
+  debugLog("[YouTube Digest Content] Loop replay at", start, mode);
+
+  if (mode === "once") {
+    video.pause();
+    clearLoop();
+  }
+}
+
+function attachLoopListener(video) {
+  if (!video || ytdLoopVideo === video) return;
+
+  detachLoopListener();
+  video.addEventListener("timeupdate", handleLoopTimeUpdate);
+  ytdLoopVideo = video;
+}
+
+function detachLoopListener() {
+  if (!ytdLoopVideo) return;
+
+  ytdLoopVideo.removeEventListener("timeupdate", handleLoopTimeUpdate);
+  ytdLoopVideo = null;
+}
+
+function clearLoop() {
+  detachLoopListener();
+  ytdLoopState = null;
+}
+
+/**
+ * Sets or clears the single replay range. Returns the range actually in
+ * effect, or null when the requested one is unusable.
+ */
+function setLoop(payload) {
+  if (payload.enabled === false) {
+    clearLoop();
+    return { success: true, loop: null };
+  }
+
+  const video = getVideoElement();
+  const duration =
+    video && Number.isFinite(video.duration) && video.duration > 0
+      ? video.duration
+      : 0;
+  const maxSeconds = duration > 0 ? duration : Infinity;
+  const start = clampSeconds(payload.start, maxSeconds);
+
+  let end = null;
+  if (payload.end !== null && payload.end !== undefined) {
+    end = clampSeconds(payload.end, maxSeconds);
+    if (end <= start) {
+      debugLog("[YouTube Digest Content] Rejecting loop end <= start");
+      clearLoop();
+      return { success: true, loop: null };
+    }
+  } else if (duration > 0 && duration <= start) {
+    debugLog("[YouTube Digest Content] Rejecting loop start past video end");
+    clearLoop();
+    return { success: true, loop: null };
+  }
+
+  ytdLoopState = {
+    start,
+    end,
+    mode: payload.mode === "once" ? "once" : "loop",
+  };
+  attachLoopListener(video);
+
+  return { success: true, loop: describeLoop() };
+}
+
+/**
+ * Snapshot used by the dictation controls: playback position plus our
+ * page-side state (captions, speed and loop).
+ */
+function getPlayerState() {
+  const video = getVideoElement();
+
+  return {
+    success: true,
+    currentTime: video ? video.currentTime : 0,
+    duration: video && Number.isFinite(video.duration) ? video.duration : 0,
+    paused: video ? video.paused : true,
+    captionsHidden: ytdCaptionsHidden,
+    // The element wins: it is the one the learner actually hears.
+    playbackRate: video
+      ? video.playbackRate
+      : (ytdPlaybackRate ?? YTD_DEFAULT_PLAYBACK_RATE),
+    loop: describeLoop(),
+  };
+}
+
+/**
+ * Toggles playback. The reported state is computed before the call so it does
+ * not depend on the async play() promise.
+ */
+function togglePlayPause() {
+  const video = getVideoElement();
+  if (!video) {
+    return { success: false, paused: true, error: "No video element found" };
+  }
+
+  const shouldPause = !video.paused;
+  if (shouldPause) {
+    video.pause();
+  } else {
+    video.play().catch(() => {}); // Ignore autoplay errors
+  }
+
+  debugLog("[YouTube Digest Content] playPause ->", shouldPause);
+  return { success: true, paused: shouldPause };
+}
+
+/**
+ * Parses "mm:ss" or "h:mm:ss" into seconds. Returns null when the text holds
+ * no usable timestamp.
+ */
+function parseTimestampToSeconds(text) {
+  if (!text) return null;
+
+  const match = String(text).match(/(?:(\d{1,3}):)?(\d{1,2}):([0-5]\d)/);
+  if (!match) return null;
+
+  const hours = match[1] ? Number(match[1]) : 0;
+  return hours * 3600 + Number(match[2]) * 60 + Number(match[3]);
+}
+
+/** A chapter line in the description: "0:00 Intro", "1:02:33 Deep dive". */
+const YTD_CHAPTER_LINE_PATTERN =
+  /^\s*(?:(\d{1,3}):)?(\d{1,2}):([0-5]\d)\s+(.+?)\s*$/;
+
+/**
+ * Chapters from the player's macro-markers list (time in #time, title in the
+ * heading link). YouTube renders hidden copies of this list, so duplicates by
+ * start time are dropped.
+ */
+function getChaptersFromPanel() {
+  const items = document.querySelectorAll(
+    'ytd-engagement-panel-section-list-renderer[target-id*="chapters"] ' +
+      "ytd-macro-markers-list-item-renderer, " +
+      "ytd-macro-markers-list-item-renderer",
+  );
+
+  const chapters = [];
+  const seenStarts = new Set();
+
+  items.forEach((item) => {
+    const timeText = item.querySelector("#time")?.textContent?.trim() || "";
+    const titleText =
+      item
+        .querySelector("h3 a yt-formatted-string, h3 a, h3 yt-formatted-string, h3")
+        ?.textContent?.trim() || "";
+    const startSeconds = parseTimestampToSeconds(timeText);
+
+    if (startSeconds === null || seenStarts.has(startSeconds)) return;
+
+    seenStarts.add(startSeconds);
+    chapters.push({ title: titleText || timeText, startSeconds });
+  });
+
+  return chapters.sort((a, b) => a.startSeconds - b.startSeconds);
+}
+
+/**
+ * Fallback: chapters parsed from the description text. YouTube gives every
+ * chapter its own block, so innerText keeps one chapter per line even when the
+ * timestamps are not rendered as links.
+ */
+function getChaptersFromDescription() {
+  const container = document.querySelector(
+    "#description-inline-expander, ytd-watch-metadata #description, " +
+      "#description-inner",
+  );
+  if (!container) return [];
+
+  const text = container.innerText || container.textContent || "";
+  const chapters = [];
+  const seenStarts = new Set();
+
+  text.split("\n").forEach((line) => {
+    const match = line.match(YTD_CHAPTER_LINE_PATTERN);
+    if (!match) return;
+
+    const hours = match[1] ? Number(match[1]) : 0;
+    const startSeconds =
+      hours * 3600 + Number(match[2]) * 60 + Number(match[3]);
+    if (seenStarts.has(startSeconds)) return;
+
+    seenStarts.add(startSeconds);
+    chapters.push({ title: match[4], startSeconds });
+  });
+
+  return chapters.sort((a, b) => a.startSeconds - b.startSeconds);
+}
+
+/**
+ * Reads the video's official chapters: panel list first, description second.
+ */
+function readChapters() {
+  const panelChapters = getChaptersFromPanel();
+  if (panelChapters.length) return { chapters: panelChapters, source: "panel" };
+
+  const descriptionChapters = getChaptersFromDescription();
+  if (descriptionChapters.length) {
+    return { chapters: descriptionChapters, source: "description" };
+  }
+
+  return { chapters: [], source: "none" };
+}
+
+/**
+ * Resets state that belongs to a single video. Captions and an explicitly set
+ * playback speed are page-level preferences, so they are simply re-applied to
+ * the new page.
+ */
+function resetPageSideState() {
+  clearLoop();
+  applyCaptionsHidden(ytdCaptionsHidden);
+  if (ytdPlaybackRate !== null) applyPlaybackRate(ytdPlaybackRate);
+}
+
+/**
+ * YouTube swaps videos without reloading, and the player element is rebuilt.
+ * yt-navigate-finish covers normal navigation; the URL watcher catches cases
+ * that bypass it (miniplayer, history API updates) so the loop can never drag
+ * on into the next video.
+ */
+document.addEventListener("yt-navigate-finish", resetPageSideState);
+
+function startUrlWatcher() {
+  ytdLastUrl = window.location.href;
+  if (ytdUrlWatchTimer) return;
+
+  ytdUrlWatchTimer = setInterval(() => {
+    const href = window.location.href;
+    if (href === ytdLastUrl) return;
+
+    ytdLastUrl = href;
+    debugLog("[YouTube Digest Content] URL changed, resetting page state");
+    resetPageSideState();
+  }, 1000);
 }
 
 // ============================================================

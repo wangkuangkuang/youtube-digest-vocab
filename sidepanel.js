@@ -470,6 +470,9 @@ function setupEventListeners() {
   // Vocab notebook (单词本) filters and tools
   setupVocabTabControls();
   void loadVocabEntries();
+
+  // Study workflow (逐句听写): captions, segments, dictation, shortcuts
+  setupStudyUi();
 }
 
 function setNotesFilter(showAll) {
@@ -592,6 +595,7 @@ async function startDigest(videoId, videoUrl) {
     transcriptScrollObserver = null;
     resetTranscriptSearch();
     lastTranscriptScrollTop = 0;
+    resetStudyForVideo();
     pendingTranscriptViewState = await loadTranscriptViewState(videoId);
     // An unseen video always starts in Original, so opening it never spends
     // translation tokens. A saved choice is restored only for this video.
@@ -1071,6 +1075,8 @@ function seekFromTranscriptEntryClick(event, seconds) {
   }
 
   seekTo(seconds);
+  // The sentence loop follows the user's click instead of looping the old line.
+  followLoopToSentence(seconds);
 }
 
 function renderTranscript() {
@@ -1085,7 +1091,7 @@ function renderTranscript() {
   // Group entries using smart sentence-boundary + time-guardrail logic
   const grouped = groupTranscriptEntries(currentTranscript);
 
-  grouped.forEach((group) => {
+  grouped.forEach((group, index) => {
     const div = document.createElement("div");
     div.className = "transcript-entry";
     div.dataset.seconds = group.start;
@@ -1102,6 +1108,7 @@ function renderTranscript() {
     div.addEventListener("click", (event) =>
       seekFromTranscriptEntryClick(event, group.start),
     );
+    attachSentenceControls(div, group.start, grouped[index + 1]?.start);
     transcriptList.appendChild(div);
   });
 
@@ -1113,6 +1120,8 @@ function renderTranscript() {
 
   // Start tracking video playback for auto-scroll
   startPlaybackTracking();
+
+  onTranscriptRendered();
 }
 
 // ============================================================
@@ -1783,6 +1792,7 @@ function renderVocabList() {
       ? `· ${currentVocabEntries.length}`
       : "";
   }
+  refreshVocabDueCount();
 
   if (!entries.length) {
     listEl.innerHTML = "";
@@ -3172,6 +3182,7 @@ async function playbackTrackingTick() {
 
     const currentTime = result.response.currentTime || 0;
     highlightActiveEntry(currentTime);
+    studyPlaybackTick(currentTime);
   } catch {
     // Silently ignore — YouTube tab might be closed or navigated away
   }
@@ -3535,6 +3546,7 @@ function renderTranscriptModeRows(segments, mode) {
     div.addEventListener("click", (event) =>
       seekFromTranscriptEntryClick(event, segment.start),
     );
+    attachSentenceControls(div, segment.start, segments[index + 1]?.start);
     transcriptList.appendChild(div);
     rows.push(div);
   });
@@ -3545,6 +3557,7 @@ function renderTranscriptModeRows(segments, mode) {
   refreshVocabHighlights();
 
   startPlaybackTracking();
+  onTranscriptRendered();
   return rows;
 }
 
@@ -3778,6 +3791,1251 @@ function setTranslatingSpinner(show) {
   const isTranslating = translationWorkCount > 0;
   const spinner = document.getElementById("langSpinner");
   if (spinner) spinner.classList.toggle("visible", isTranslating);
+}
+
+// ============================================================
+// STUDY WORKFLOW — 逐句听写 (captions / segments / dictation / SRS)
+// ============================================================
+// This region is DOM + messaging only. Every decision (segment cutting, word
+// diff, spaced repetition) lives in study.js / vocab.js so it stays testable.
+//
+// Page-side effects go through relayToContent and degrade to a toast when the
+// content script has not been reloaded yet: an extension update must never
+// wedge the side panel.
+
+const CAPTIONS_HIDDEN_KEY = "ytd_captions_hidden";
+const STUDY_PROGRESS_PREFIX = "ytd_progress_";
+const STUDY_DICTATION_PREFIX = "ytd_dictation_";
+const STUDY_RELAY_TIMEOUT_MS = 1500;
+const STUDY_SEGMENT_MAX_SECONDS = 1200;
+const STUDY_KEY_CAP = 40;
+
+const LEGACY_PAGE_HINT = "页面未响应，请重新加载 YouTube 页面";
+
+// ——— state ———
+let captionsHidden = false;
+let playbackRate = 1; // mirrors the speed actually live in the player
+let sentenceLoop = null; // {startSeconds, endSeconds} currently looping
+let studySegments = []; // [{index,title,startSeconds,endSeconds,done}]
+let studyActiveSegment = -1;
+let studyVideoId = null; // video the study state below belongs to
+let studyPlaybackSegment = -1;
+let studyPlaybackSentenceSeconds = -1;
+let sentenceFocusIndex = -1; // keyboard cursor, independent of playhead lag
+let boundaryPauseEnabled = false;
+let dictationTarget = "sentence";
+let dictationRecords = {}; // {[segmentIndex]: {text, accuracy, updatedAt}}
+let lastDictationTarget = null;
+let lastDictationResult = null;
+let studyToastTimer = null;
+let vocabReviewState = null;
+
+const SENTENCE_REPLAY_ICON =
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 1 1 2.4 5.7"></path><path d="M4 20v-6h6"></path></svg>';
+const SENTENCE_LOOP_ICON =
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 2l4 4-4 4"></path><path d="M3 12v-2a4 4 0 0 1 4-4h14"></path><path d="M7 22l-4-4 4-4"></path><path d="M21 12v2a4 4 0 0 1-4 4H3"></path></svg>';
+const SEGMENT_DONE_ICON =
+  '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.5"></circle><path d="m5 8.2 2 2 4-4.4"></path></svg>';
+const SEGMENT_TODO_ICON =
+  '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.5"></circle></svg>';
+
+// ——— feedback ———
+
+function showStudyToast(message, { variant = "info", duration = 2400 } = {}) {
+  let toast = document.getElementById("studyToast");
+  if (!toast) {
+    toast = document.createElement("div");
+    toast.id = "studyToast";
+    toast.className = "study-toast";
+    toast.setAttribute("role", "status");
+    document.body.appendChild(toast);
+  }
+  toast.textContent = message;
+  toast.dataset.variant = variant;
+  toast.classList.add("visible");
+  clearTimeout(studyToastTimer);
+  studyToastTimer = setTimeout(() => {
+    toast.classList.remove("visible");
+  }, duration);
+}
+
+/**
+ * One tolerant call to the YouTube tab. Returns `null` on timeout, on a
+ * `success:false` relay, or when the content script is an older build that
+ * does not know the action yet.
+ */
+async function relayToPlayer(payload) {
+  let timeoutId;
+  const timeout = new Promise((resolve) => {
+    timeoutId = setTimeout(() => resolve(null), STUDY_RELAY_TIMEOUT_MS);
+  });
+  try {
+    const response = await Promise.race([
+      chrome.runtime.sendMessage({ action: "relayToContent", payload }),
+      timeout,
+    ]);
+    clearTimeout(timeoutId);
+    if (!response || response.success === false) return null;
+    return response.response ?? null;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    debugLog("[YouTube Digest] player relay failed:", payload?.action, error);
+    return null;
+  }
+}
+
+// ============================================================
+// A. CAPTIONS OVERLAY + PER-SENTENCE PLAYBACK
+// ============================================================
+
+function setCaptionsToggleButton(hidden) {
+  const button = document.getElementById("captionsToggleBtn");
+  if (!button) return;
+  button.textContent = hidden ? "字幕：关" : "字幕：开";
+  button.classList.toggle("active", hidden);
+  button.setAttribute("aria-pressed", String(hidden));
+}
+
+async function loadCaptionsHidden() {
+  try {
+    const stored = await chrome.storage.local.get(CAPTIONS_HIDDEN_KEY);
+    return Boolean(stored?.[CAPTIONS_HIDDEN_KEY]);
+  } catch (error) {
+    debugLog("[YouTube Digest] captions setting load failed:", error);
+    return false;
+  }
+}
+
+async function saveCaptionsHidden(hidden) {
+  try {
+    await chrome.storage.local.set({ [CAPTIONS_HIDDEN_KEY]: hidden });
+  } catch (error) {
+    debugLog("[YouTube Digest] captions setting save failed:", error);
+  }
+}
+
+/**
+ * Pushes the遮罩 state to the player and remembers the intent even when the
+ * page cannot honour it yet (the setting is re-applied on the next video).
+ */
+async function applyCaptionsHidden(hidden, { announce = true } = {}) {
+  const response = await relayToPlayer({ action: "setCaptionsHidden", hidden });
+  if (!response || typeof response.hidden !== "boolean") {
+    captionsHidden = Boolean(hidden);
+    setCaptionsToggleButton(captionsHidden);
+    await saveCaptionsHidden(captionsHidden);
+    if (announce) showStudyToast(LEGACY_PAGE_HINT, { variant: "error" });
+    return captionsHidden;
+  }
+  captionsHidden = response.hidden;
+  setCaptionsToggleButton(captionsHidden);
+  await saveCaptionsHidden(captionsHidden);
+  if (announce) {
+    showStudyToast(captionsHidden ? "字幕已遮挡" : "字幕已显示");
+  }
+  return captionsHidden;
+}
+
+async function toggleCaptionsHidden() {
+  return applyCaptionsHidden(!captionsHidden);
+}
+
+// ============================================================
+// A2. PLAYBACK SPEED (听写降速)
+// ============================================================
+
+// The gears themselves live in study.js so they can be unit tested; this
+// block only mirrors the value the page reports back.
+
+function setPlaybackRateButton(rate) {
+  const button = document.getElementById("playbackRateBtn");
+  if (!button) return;
+  button.textContent = `速度 ${YTD_STUDY.formatRate(rate)}`;
+}
+
+/**
+ * Pushes a speed to the player and echoes what the page actually applied.
+ * Unlike the caption overlay there is no panel-side copy to restore from: the
+ * content script owns the stored value, so a silent page leaves the button on
+ * the last value it really confirmed instead of showing a speed that is not
+ * playing.
+ */
+async function applyPlaybackRate(rate, { announce = true } = {}) {
+  const response = await relayToPlayer({ action: "setPlaybackRate", rate });
+  if (!response || !Number.isFinite(Number(response.rate))) {
+    if (announce) showStudyToast(LEGACY_PAGE_HINT, { variant: "error" });
+    return playbackRate;
+  }
+  playbackRate = Number(response.rate);
+  setPlaybackRateButton(playbackRate);
+  if (announce) {
+    showStudyToast(`速度 ${YTD_STUDY.formatRate(playbackRate)}`, {
+      duration: 1200,
+    });
+  }
+  return playbackRate;
+}
+
+/** `[` and `]`: one gear down or up, stopping at either end. */
+async function stepPlaybackRate(direction) {
+  return applyPlaybackRate(YTD_STUDY.nextRate(playbackRate, direction));
+}
+
+/** Toolbar click: cycle the gears so one button reaches every speed. */
+async function cyclePlaybackRate() {
+  return applyPlaybackRate(YTD_STUDY.nextRate(playbackRate, 1, { wrap: true }));
+}
+
+/**
+ * Adopts the speed already live in the player. Runs when the panel opens and
+ * on every video change, where the page re-applies its stored speed.
+ */
+async function syncPlaybackRate() {
+  const state = await relayToPlayer({ action: "getPlayerState" });
+  const rate = Number(state?.playbackRate);
+  if (!Number.isFinite(rate) || rate <= 0) return playbackRate;
+  playbackRate = rate;
+  setPlaybackRateButton(playbackRate);
+  return playbackRate;
+}
+
+/** The sentence range: this row's start to the next row's start. */
+function sentenceRange(startSeconds, nextSeconds) {
+  const start = Math.max(0, Number(startSeconds) || 0);
+  const next = Number(nextSeconds);
+  let end;
+  if (Number.isFinite(next) && next > start) end = next;
+  else if (Number.isFinite(currentVideoDuration) && currentVideoDuration > start) {
+    end = currentVideoDuration;
+  } else end = start + 20;
+  return { startSeconds: start, endSeconds: end };
+}
+
+function sentenceText(row) {
+  if (!row) return "";
+  const node =
+    row.querySelector(".transcript-original") ||
+    row.querySelector(".transcript-text");
+  return (node?.textContent || "").trim();
+}
+
+function transcriptRows() {
+  return Array.from(document.querySelectorAll("#transcriptList .transcript-entry"));
+}
+
+function activeTranscriptRow() {
+  const rows = transcriptRows();
+  return (
+    rows.find((row) => row.classList.contains("active-playback")) ||
+    rows[0] ||
+    null
+  );
+}
+
+/**
+ * Resolve the sentence range the workflow should talk about. `seconds` wins when
+ * it matches a row, then the learner's reading cursor; the playback row is the
+ * last resort because the playhead refreshes only once per tracking tick.
+ */
+function currentSentenceRange(seconds, options) {
+  const rows = transcriptRows();
+  if (!rows.length) return null;
+  const preferCursor = !options || options.preferCursor !== false;
+  let index = -1;
+  if (
+    typeof seconds === "number" &&
+    Number.isFinite(seconds) &&
+    seconds >= 0
+  ) {
+    index = rows.findIndex(
+      (row) => Math.abs(Number(row.dataset.seconds) - seconds) < 0.01,
+    );
+  }
+  // Prefer the sentence the learner is reading: the playhead can lag a seek by
+  // one tracking tick, and Number(null) === 0 would otherwise mean "sentence 1".
+  if (
+    index === -1 &&
+    preferCursor &&
+    sentenceFocusIndex >= 0 &&
+    sentenceFocusIndex < rows.length
+  ) {
+    index = sentenceFocusIndex;
+  }
+  if (index === -1) {
+    index = rows.findIndex((row) => row.classList.contains("active-playback"));
+  }
+  if (index === -1) index = 0;
+  const row = rows[index];
+  const range = sentenceRange(
+    row.dataset.seconds,
+    rows[index + 1]?.dataset.seconds,
+  );
+  return Object.assign(range, { row, index, text: sentenceText(row) });
+}
+
+async function pushSentenceLoop(range, mode) {
+  const response = await relayToPlayer({
+    action: "setLoop",
+    start: range.startSeconds,
+    end: range.endSeconds,
+    mode,
+    enabled: true,
+  });
+  if (!response) {
+    showStudyToast(LEGACY_PAGE_HINT, { variant: "error" });
+    return false;
+  }
+  return true;
+}
+
+async function replaySentence(range) {
+  if (!range) return;
+  if (await pushSentenceLoop(range, "once")) {
+    showStudyToast(
+      `重播 ${YTD_STUDY.formatClock(range.startSeconds)}–${YTD_STUDY.formatClock(range.endSeconds)}`,
+    );
+  }
+}
+
+async function toggleSentenceLoop(range) {
+  if (!range) return;
+  if (
+    sentenceLoop &&
+    Math.abs(sentenceLoop.startSeconds - range.startSeconds) < 0.01
+  ) {
+    await stopSentenceLoop();
+    return;
+  }
+  if (!(await pushSentenceLoop(range, "loop"))) return;
+  sentenceLoop = {
+    startSeconds: range.startSeconds,
+    endSeconds: range.endSeconds,
+  };
+  refreshLoopHighlight();
+  showStudyToast("循环本句（再按 L 取消）");
+}
+
+async function stopSentenceLoop({ announce = true } = {}) {
+  sentenceLoop = null;
+  refreshLoopHighlight();
+  if (announce) showStudyToast("已取消循环");
+  await relayToPlayer({
+    action: "setLoop",
+    start: 0,
+    end: null,
+    mode: "loop",
+    enabled: false,
+  });
+}
+
+/** Keeps the looping ring on exactly one row. */
+function refreshLoopHighlight() {
+  transcriptRows().forEach((row) => {
+    const active =
+      Boolean(sentenceLoop) &&
+      Math.abs(Number(row.dataset.seconds) - sentenceLoop.startSeconds) < 0.01;
+    row.classList.toggle("sentence-looping", active);
+    const button = row.querySelector(".sentence-loop-btn");
+    button?.classList.toggle("active", active);
+    button?.setAttribute("aria-pressed", String(active));
+  });
+}
+
+/** Re-arms the loop on the new sentence so no stale range is left behind. */
+function followLoopToSentence(seconds) {
+  if (!sentenceLoop) return;
+  const range = currentSentenceRange(seconds);
+  if (!range) return;
+  if (Math.abs(range.startSeconds - sentenceLoop.startSeconds) < 0.01) return;
+  sentenceLoop = {
+    startSeconds: range.startSeconds,
+    endSeconds: range.endSeconds,
+  };
+  refreshLoopHighlight();
+  void pushSentenceLoop(range, "loop");
+}
+
+/** Adds 重播/循环 next to the existing click-to-seek row behaviour. */
+function attachSentenceControls(row, seconds, nextSeconds) {
+  const tools = document.createElement("span");
+  tools.className = "sentence-tools";
+
+  const replay = document.createElement("button");
+  replay.type = "button";
+  replay.className = "sentence-btn sentence-replay-btn";
+  replay.title = "重播本句";
+  replay.setAttribute("aria-label", "重播本句");
+  replay.innerHTML = SENTENCE_REPLAY_ICON;
+
+  const loop = document.createElement("button");
+  loop.type = "button";
+  loop.className = "sentence-btn sentence-loop-btn";
+  loop.title = "循环本句";
+  loop.setAttribute("aria-label", "循环本句");
+  loop.setAttribute("aria-pressed", "false");
+  loop.innerHTML = SENTENCE_LOOP_ICON;
+
+  replay.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    void replaySentence(sentenceRange(seconds, nextSeconds));
+  });
+  loop.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    void toggleSentenceLoop(sentenceRange(seconds, nextSeconds));
+  });
+
+  tools.append(replay, loop);
+  row.appendChild(tools);
+
+  // Remember where the user is reading so ↑/↓ walk from there even before the
+  // playhead (and therefore active-playback) catches up with the seek.
+  row.addEventListener("click", () => {
+    sentenceFocusIndex = transcriptRows().indexOf(row);
+  });
+}
+
+// ============================================================
+// B. KEYBOARD SHORTCUTS
+// ============================================================
+
+function isEditableTarget(target) {
+  if (!target || !target.tagName) return false;
+  const tag = target.tagName.toUpperCase();
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || Boolean(target.isContentEditable);
+}
+
+/**
+ * Side-panel keydown handler. The side panel is a separate document, so these
+ * never reach YouTube's own shortcuts. Everything is ignored while an input
+ * owns the focus (that is how the learner types dictation at all); Escape
+ * releases the focus.
+ */
+function handleStudyShortcut(event) {
+  if (isEditableTarget(event.target)) {
+    if (event.key === "Escape") event.target.blur();
+    return;
+  }
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+
+  const hasTranscript = transcriptRows().length > 0;
+  switch (event.key) {
+    case " ":
+    case "Spacebar":
+      event.preventDefault();
+      void togglePlayback();
+      break;
+    case "ArrowUp":
+      if (!hasTranscript) return;
+      event.preventDefault();
+      moveSentenceFocus(-1);
+      break;
+    case "ArrowDown":
+      if (!hasTranscript) return;
+      event.preventDefault();
+      moveSentenceFocus(1);
+      break;
+    case "r":
+    case "R":
+      if (!hasTranscript) return;
+      event.preventDefault();
+      void replayCurrentSentence();
+      break;
+    case "l":
+    case "L":
+      if (!hasTranscript) return;
+      event.preventDefault();
+      void toggleLoopCurrentSentence();
+      break;
+    case "c":
+    case "C":
+      event.preventDefault();
+      void toggleCaptionsHidden();
+      break;
+    case "[":
+      event.preventDefault();
+      void stepPlaybackRate(-1);
+      break;
+    case "]":
+      event.preventDefault();
+      void stepPlaybackRate(1);
+      break;
+    case "d":
+    case "D":
+      event.preventDefault();
+      toggleDictationPanel();
+      break;
+    default:
+      break;
+  }
+}
+
+async function togglePlayback() {
+  const response = await relayToPlayer({ action: "playPause" });
+  if (!response || typeof response.paused !== "boolean") {
+    showStudyToast(LEGACY_PAGE_HINT, { variant: "error" });
+    return;
+  }
+  showStudyToast(response.paused ? "已暂停" : "播放中");
+}
+
+async function pausePlayback() {
+  const state = await relayToPlayer({ action: "getPlayerState" });
+  if (state && state.paused === false) {
+    await relayToPlayer({ action: "playPause" });
+  }
+}
+
+function focusTranscriptRow(row) {
+  const rows = transcriptRows();
+  rows.forEach((el) => {
+    if (el !== row) el.classList.remove("keyboard-focus");
+  });
+  row.classList.add("keyboard-focus");
+  sentenceFocusIndex = rows.indexOf(row);
+  lastAutoScrollTime = Date.now();
+  row.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function moveSentenceFocus(delta) {
+  const rows = transcriptRows();
+  if (!rows.length) return;
+  let index = sentenceFocusIndex;
+  if (!(index >= 0 && index < rows.length)) {
+    index = rows.findIndex((row) => row.classList.contains("active-playback"));
+  }
+  if (index === -1) index = delta > 0 ? -1 : 0;
+  const target = Math.min(rows.length - 1, Math.max(0, index + delta));
+  const row = rows[target];
+  const seconds = Number(row.dataset.seconds) || 0;
+  focusTranscriptRow(row);
+  void seekTo(seconds);
+  followLoopToSentence(seconds);
+  const kind = delta < 0 ? "上一句" : "下一句";
+  showStudyToast(`${kind} ${YTD_STUDY.formatClock(seconds)}`, { duration: 1200 });
+}
+
+async function replayCurrentSentence() {
+  await replaySentence(currentSentenceRange(null));
+}
+
+async function toggleLoopCurrentSentence() {
+  await toggleSentenceLoop(currentSentenceRange(null));
+}
+
+// ============================================================
+// C. SEGMENTS + PROGRESS
+// ============================================================
+
+function studyProgressKey(videoId) {
+  return STUDY_PROGRESS_PREFIX + videoId;
+}
+
+function dictationStorageKey(videoId) {
+  return STUDY_DICTATION_PREFIX + videoId;
+}
+
+async function loadStudyProgress(videoId) {
+  try {
+    const key = studyProgressKey(videoId);
+    const stored = await chrome.storage.local.get(key);
+    return stored?.[key] || null;
+  } catch (error) {
+    debugLog("[YouTube Digest] study progress load failed:", error);
+    return null;
+  }
+}
+
+async function saveStudyProgress() {
+  if (!studyVideoId) return;
+  try {
+    await chrome.storage.local.set({
+      [studyProgressKey(studyVideoId)]: {
+        segments: studySegments.map((segment) => ({
+          index: segment.index,
+          title: segment.title,
+          startSeconds: segment.startSeconds,
+          endSeconds: segment.endSeconds,
+          done: Boolean(segment.done),
+        })),
+        activeIndex: studyActiveSegment,
+        updatedAt: Date.now(),
+      },
+    });
+  } catch (error) {
+    debugLog("[YouTube Digest] study progress save failed:", error);
+  }
+}
+
+/** Keeps per-video keys from growing forever inside chrome.storage.local. */
+async function pruneStudyStorage() {
+  try {
+    const all = await chrome.storage.local.get(null);
+    const keys = Object.keys(all || {}).filter(
+      (key) =>
+        key.startsWith(STUDY_PROGRESS_PREFIX) ||
+        key.startsWith(STUDY_DICTATION_PREFIX),
+    );
+    if (keys.length <= STUDY_KEY_CAP) return;
+    keys.sort(
+      (a, b) =>
+        (Number(all[b]?.updatedAt) || 0) - (Number(all[a]?.updatedAt) || 0),
+    );
+    await chrome.storage.local.remove(keys.slice(STUDY_KEY_CAP));
+  } catch (error) {
+    debugLog("[YouTube Digest] study storage prune failed:", error);
+  }
+}
+
+async function fetchChapters() {
+  const response = await relayToPlayer({ action: "getChapters" });
+  if (!response || !Array.isArray(response.chapters)) return [];
+  return response.chapters;
+}
+
+function mergeSegmentProgress(computed, saved) {
+  const doneStarts = new Set(
+    (saved?.segments || [])
+      .filter((segment) => segment?.done)
+      .map((segment) => Math.round(Number(segment.startSeconds) || 0)),
+  );
+  return computed.map((segment) =>
+    Object.assign({}, segment, {
+      done: doneStarts.has(Math.round(segment.startSeconds)),
+    }),
+  );
+}
+
+/**
+ * Rebuilds the segment list for the current video. Chapters come from the
+ * page when available; otherwise study.js chunks the transcript by time.
+ */
+async function refreshStudySegments() {
+  if (!currentVideoId || !currentTranscript?.length) return;
+  const videoId = currentVideoId;
+  const chapters = await fetchChapters();
+  if (videoId !== currentVideoId) return;
+
+  const computed = YTD_STUDY.splitIntoSegments({
+    chapters: chapters,
+    transcriptSegments: currentTranscript,
+    maxSeconds: STUDY_SEGMENT_MAX_SECONDS,
+  });
+  const saved = await loadStudyProgress(videoId);
+  if (videoId !== currentVideoId) return;
+
+  studyVideoId = videoId;
+  studySegments = mergeSegmentProgress(computed, saved);
+  studyPlaybackSegment = -1;
+  studyPlaybackSentenceSeconds = -1;
+  const savedIndex = Number(saved?.activeIndex);
+  studyActiveSegment =
+    Number.isInteger(savedIndex) &&
+    studySegments.some((segment) => segment.index === savedIndex)
+      ? savedIndex
+      : studySegments.length
+        ? 1
+        : -1;
+
+  dictationRecords = await loadDictationRecords(videoId);
+  renderStudySegments();
+  refreshDictationTarget();
+  // Persist immediately so reopening the video restores the same active
+  // segment even if the learner only looked around the first time.
+  await saveStudyProgress();
+}
+
+function onTranscriptRendered() {
+  refreshLoopHighlight();
+  if (studyVideoId === currentVideoId && studySegments.length) {
+    refreshDictationTarget();
+    return;
+  }
+  void refreshStudySegments();
+}
+
+function renderStudySegments() {
+  const list = document.getElementById("segmentList");
+  const progressEl = document.getElementById("segmentProgress");
+  if (!list) return;
+  list.innerHTML = "";
+
+  if (!studySegments.length) {
+    const empty = document.createElement("div");
+    empty.className = "study-empty";
+    empty.textContent = "暂无字幕，无法切分段落";
+    list.appendChild(empty);
+    if (progressEl) progressEl.textContent = "";
+    return;
+  }
+
+  studySegments.forEach((segment) => {
+    const row = document.createElement("div");
+    row.className = "segment-row";
+    row.dataset.segmentIndex = segment.index;
+    if (segment.index === studyActiveSegment) row.classList.add("active");
+    if (segment.done) row.classList.add("done");
+    row.innerHTML = `
+      <span class="segment-check" aria-hidden="true">${segment.done ? SEGMENT_DONE_ICON : SEGMENT_TODO_ICON}</span>
+      <span class="segment-body">
+        <span class="segment-title">${escapeHtml(segment.title)}</span>
+        <span class="segment-range">${YTD_STUDY.formatClock(segment.startSeconds)}–${YTD_STUDY.formatClock(segment.endSeconds)}</span>
+      </span>
+      <button class="segment-done-btn" type="button" aria-pressed="${segment.done}">${segment.done ? "取消完成" : "标记完成"}</button>
+    `;
+    row.addEventListener("click", () => {
+      studyActiveSegment = segment.index;
+      studyPlaybackSegment = segment.index;
+      focusStudySegment(segment.index);
+      void seekTo(segment.startSeconds);
+      void saveStudyProgress();
+    });
+    row.querySelector(".segment-done-btn").addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void toggleSegmentDone(segment.index);
+    });
+    list.appendChild(row);
+  });
+
+  if (progressEl) {
+    const done = studySegments.filter((segment) => segment.done).length;
+    progressEl.textContent = `已完成 ${done} / ${studySegments.length} 段`;
+  }
+}
+
+/** Cheap class swap for the 500ms playback tick (no full re-render). */
+function focusStudySegment(index) {
+  document.querySelectorAll("#segmentList .segment-row").forEach((row) => {
+    row.classList.toggle("active", Number(row.dataset.segmentIndex) === index);
+  });
+}
+
+async function toggleSegmentDone(index) {
+  const segment = studySegments.find((item) => item.index === index);
+  if (!segment) return;
+  segment.done = !segment.done;
+  renderStudySegments();
+  await saveStudyProgress();
+  showStudyToast(
+    segment.done ? `第 ${index} 段已标记完成` : `第 ${index} 段恢复为未完成`,
+    { duration: 1400 },
+  );
+}
+
+function clearStaleKeyboardFocus() {
+  document
+    .querySelectorAll("#transcriptList .transcript-entry.keyboard-focus:not(.active-playback)")
+    .forEach((row) => row.classList.remove("keyboard-focus"));
+}
+
+/**
+ * Segment bookkeeping that rides the existing playback tick: follows the
+ * active segment, announces a boundary crossing, and optionally pauses there.
+ */
+function studyPlaybackTick(currentTime) {
+  clearStaleKeyboardFocus();
+  if (studySegments.length) {
+    const index = YTD_STUDY.activeSegmentIndex(studySegments, currentTime);
+    if (index > 0 && index !== studyPlaybackSegment) {
+      const finished = studyPlaybackSegment;
+      studyPlaybackSegment = index;
+      studyActiveSegment = index;
+      focusStudySegment(index);
+      void saveStudyProgress();
+      if (finished > 0) {
+        const done = studySegments.find((item) => item.index === finished);
+        showStudyToast(`已进入第 ${index} 段`);
+        if (done) debugLog("[YouTube Digest] finished segment:", done.title);
+        if (boundaryPauseEnabled) void pausePlayback();
+      }
+    }
+  }
+
+  const panel = document.getElementById("dictationPanel");
+  if (!panel || panel.hidden) return;
+  const active = document.querySelector(
+    "#transcriptList .transcript-entry.active-playback",
+  );
+  const seconds = Number(active?.dataset.seconds);
+  if (Number.isFinite(seconds) && seconds !== studyPlaybackSentenceSeconds) {
+    studyPlaybackSentenceSeconds = seconds;
+    maybeRefreshDictationTarget();
+  }
+}
+
+// ============================================================
+// D. DICTATION PANEL
+// ============================================================
+
+async function loadDictationRecords(videoId) {
+  try {
+    const key = dictationStorageKey(videoId);
+    const stored = await chrome.storage.local.get(key);
+    const records = stored?.[key];
+    return records && typeof records === "object" ? records : {};
+  } catch (error) {
+    debugLog("[YouTube Digest] dictation load failed:", error);
+    return {};
+  }
+}
+
+async function saveDictationRecords() {
+  if (!studyVideoId) return;
+  try {
+    await chrome.storage.local.set({
+      [dictationStorageKey(studyVideoId)]: dictationRecords,
+    });
+  } catch (error) {
+    debugLog("[YouTube Digest] dictation save failed:", error);
+    showStudyToast("听写保存失败", { variant: "error" });
+  }
+}
+
+function segmentIndexForTime(seconds) {
+  const index = YTD_STUDY.activeSegmentIndex(studySegments, seconds);
+  if (index > 0) return index;
+  if (studyActiveSegment > 0) return studyActiveSegment;
+  return 1;
+}
+
+function segmentRange(index) {
+  const segment = studySegments.find((item) => item.index === index);
+  if (!segment) return null;
+  return {
+    startSeconds: segment.startSeconds,
+    endSeconds: segment.endSeconds,
+    text: YTD_STUDY.segmentTextForRange(
+      currentTranscript || [],
+      segment.startSeconds,
+      segment.endSeconds,
+    ),
+  };
+}
+
+function currentDictationTarget() {
+  if (dictationTarget === "segment") {
+    const index = studyActiveSegment > 0 ? studyActiveSegment : 1;
+    const range = segmentRange(index);
+    if (range) {
+      return {
+        kind: "segment",
+        index: index,
+        startSeconds: range.startSeconds,
+        endSeconds: range.endSeconds,
+        text: range.text,
+      };
+    }
+  }
+  // Dictation mirrors the video: when a playback row exists it wins, so the
+  // reading cursor cannot pin the panel to an old line while the video runs.
+  const activeRow = document.querySelector(
+    "#transcriptList .transcript-entry.active-playback",
+  );
+  const playbackSeconds = Number(activeRow?.dataset.seconds);
+  const sentence = currentSentenceRange(
+    Number.isFinite(playbackSeconds) ? playbackSeconds : null,
+  );
+  if (!sentence) {
+    return { kind: "sentence", index: 1, startSeconds: 0, endSeconds: 0, text: "" };
+  }
+  return {
+    kind: "sentence",
+    index: segmentIndexForTime(sentence.startSeconds),
+    startSeconds: sentence.startSeconds,
+    endSeconds: sentence.endSeconds,
+    text: sentence.text,
+  };
+}
+
+function setDictationScore(text) {
+  const el = document.getElementById("dictationScore");
+  if (el) el.textContent = text || "";
+}
+
+function refreshDictationTarget() {
+  const target = currentDictationTarget();
+  lastDictationTarget = target;
+  lastDictationResult = null;
+  const ref = document.getElementById("dictationReference");
+  const input = document.getElementById("dictationInput");
+  const result = document.getElementById("dictationResult");
+  const words = target.text ? target.text.split(/\s+/).length : 0;
+  if (ref) {
+    const label =
+      target.kind === "segment"
+        ? `本段 · 第 ${target.index} 段`
+        : `本句 · ${YTD_STUDY.formatClock(target.startSeconds)}`;
+    ref.textContent = target.text
+      ? `${label}（${words} 词；批改前不显示原文）`
+      : "选中一句字幕，点“听写”开始。";
+  }
+  if (input) input.value = dictationRecords[target.index]?.text || "";
+  if (result) result.replaceChildren();
+  const saved = dictationRecords[target.index];
+  setDictationScore(saved ? `上次准确率 ${saved.accuracy}%` : "");
+}
+
+function editableInputIsPristine(input) {
+  const value = input.value.trim();
+  if (!value) return true;
+  const saved = dictationRecords[lastDictationTarget?.index];
+  return Boolean(saved && saved.text.trim() === value);
+}
+
+/** Never overwrite what the learner is typing mid-sentence. */
+function maybeRefreshDictationTarget() {
+  const panel = document.getElementById("dictationPanel");
+  const input = document.getElementById("dictationInput");
+  if (!panel || panel.hidden || !input) return;
+  if (!editableInputIsPristine(input)) return;
+  refreshDictationTarget();
+}
+
+function renderDictationToken(token) {
+  const span = document.createElement("span");
+  span.className = `dictation-token token-${token.type}`;
+  if (token.type === "equal") {
+    span.textContent = token.expected;
+    return span;
+  }
+  if (token.type === "missing") {
+    span.textContent = token.expected;
+    span.title = "漏写";
+    return span;
+  }
+  if (token.type === "extra") {
+    span.textContent = token.actual;
+    span.title = "多写";
+    return span;
+  }
+  span.textContent = token.expected;
+  const actual = document.createElement("span");
+  actual.className = "dictation-actual";
+  actual.textContent = token.actual;
+  span.appendChild(actual);
+  span.title = "写错";
+  return span;
+}
+
+function checkDictation() {
+  const target = lastDictationTarget || currentDictationTarget();
+  const input = document.getElementById("dictationInput");
+  const resultEl = document.getElementById("dictationResult");
+  if (!input || !resultEl) return;
+  if (!target.text) {
+    showStudyToast("当前没有可对照的句子", { variant: "error" });
+    return;
+  }
+
+  const diff = YTD_STUDY.diffWords(target.text, input.value);
+  const list = document.createElement("div");
+  list.className = "dictation-tokens";
+  diff.tokens.forEach((token) => list.appendChild(renderDictationToken(token)));
+  resultEl.replaceChildren(list);
+  setDictationScore(
+    `准确率 ${diff.accuracyPercent}% · 错词 ${diff.mistakeCount} · 漏 ${diff.missingCount} · 多 ${diff.extraCount}`,
+  );
+  lastDictationResult = { diff: diff, target: target };
+}
+
+async function replayDictation() {
+  const target = lastDictationTarget || currentDictationTarget();
+  if (!target.text) {
+    showStudyToast("当前没有可重听的内容", { variant: "error" });
+    return;
+  }
+  await replaySentence({
+    startSeconds: target.startSeconds,
+    endSeconds: target.endSeconds,
+  });
+}
+
+async function saveDictation() {
+  const target = lastDictationTarget || currentDictationTarget();
+  const input = document.getElementById("dictationInput");
+  if (!input) return;
+  const diff = YTD_STUDY.diffWords(target.text, input.value);
+  dictationRecords[target.index] = {
+    text: input.value,
+    accuracy: diff.accuracyPercent,
+    updatedAt: Date.now(),
+  };
+  await saveDictationRecords();
+  setDictationScore(`已保存 · 准确率 ${diff.accuracyPercent}%`);
+  showStudyToast(`第 ${target.index} 段听写已保存`);
+}
+
+function setDictationTarget(target) {
+  dictationTarget = target === "segment" ? "segment" : "sentence";
+  document.querySelectorAll("[data-dictation-target]").forEach((button) => {
+    const active = button.dataset.dictationTarget === dictationTarget;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  refreshDictationTarget();
+}
+
+function toggleDictationPanel(force) {
+  const panel = document.getElementById("dictationPanel");
+  const button = document.getElementById("dictationToggleBtn");
+  if (!panel) return;
+  const open = typeof force === "boolean" ? force : panel.hidden;
+  if (open && !transcriptTabIsActive()) switchTab("transcript");
+  panel.hidden = !open;
+  button?.classList.toggle("active", open);
+  button?.setAttribute("aria-expanded", String(open));
+  if (open) refreshDictationTarget();
+}
+
+function toggleStudyPanel(panelId, buttonId, force) {
+  const panel = document.getElementById(panelId);
+  const button = document.getElementById(buttonId);
+  if (!panel) return;
+  const open = typeof force === "boolean" ? force : panel.hidden;
+  panel.hidden = !open;
+  button?.classList.toggle("active", open);
+  button?.setAttribute("aria-expanded", String(open));
+}
+
+// ============================================================
+// E. VOCAB REVIEW (间隔重复)
+// ============================================================
+
+function refreshVocabDueCount() {
+  const badge = document.getElementById("vocabDueCount");
+  const button = document.getElementById("vocabReviewBtn");
+  if (!badge) return 0;
+  const count = YTD_VOCAB.dueEntries(currentVocabEntries, Date.now()).length;
+  badge.textContent = String(count);
+  button?.classList.toggle("has-due", count > 0);
+  return count;
+}
+
+function startVocabReview() {
+  const due = YTD_VOCAB.dueEntries(currentVocabEntries, Date.now());
+  if (!due.length) {
+    showStudyToast("今天没有到期的单词");
+    return;
+  }
+  vocabReviewState = {
+    entries: due,
+    index: 0,
+    graded: { again: 0, hard: 0, good: 0 },
+  };
+  renderVocabReview();
+}
+
+function exitVocabReview() {
+  vocabReviewState = null;
+  const box = document.getElementById("vocabReview");
+  if (box) {
+    box.hidden = true;
+    box.innerHTML = "";
+  }
+  const list = document.getElementById("vocabList");
+  if (list) list.style.display = "";
+  renderVocabList();
+}
+
+async function gradeVocabReview(grade) {
+  if (!vocabReviewState) return;
+  const entry = vocabReviewState.entries[vocabReviewState.index];
+  if (!entry) return;
+  const graded = YTD_VOCAB.applySrsGrade(entry, grade, Date.now());
+  vocabReviewState.graded[grade] += 1;
+  Object.assign(entry, graded); // optimistic: keep the list honest
+  refreshVocabDueCount();
+  const result = await chrome.runtime.sendMessage({
+    action: "updateVocabEntry",
+    id: graded.id,
+    patch: {
+      mastery: graded.mastery,
+      due: graded.due,
+      interval: graded.interval,
+      ease: graded.ease,
+      reviewCount: graded.reviewCount,
+      lapses: graded.lapses,
+      lastReviewedAt: graded.lastReviewedAt,
+    },
+  });
+  if (!result?.success) showStudyToast("复习进度保存失败", { variant: "error" });
+  vocabReviewState.index += 1;
+  renderVocabReview();
+}
+
+function renderVocabReview() {
+  const box = document.getElementById("vocabReview");
+  const list = document.getElementById("vocabList");
+  if (!box || !vocabReviewState) return;
+  box.hidden = false;
+  if (list) list.style.display = "none";
+  box.innerHTML = "";
+
+  const frame = document.createElement("div");
+  frame.className = "vocab-quiz-frame";
+  const total = vocabReviewState.entries.length;
+  const done = vocabReviewState.index >= total;
+
+  if (done) {
+    const graded = vocabReviewState.graded;
+    frame.innerHTML = `
+      <div class="vocab-quiz-title">复习完成</div>
+      <div class="vocab-quiz-score">认识 ${graded.good} · 模糊 ${graded.hard} · 忘记 ${graded.again}</div>
+      <div class="vocab-quiz-actions">
+        <button class="enhance-btn" type="button" id="vocabReviewAgain">继续复习</button>
+        <button class="enhance-btn" type="button" id="vocabReviewExit">退出复习</button>
+      </div>
+    `;
+    box.appendChild(frame);
+    frame.querySelector("#vocabReviewAgain").addEventListener("click", () => {
+      startVocabReview();
+    });
+    frame.querySelector("#vocabReviewExit").addEventListener("click", () => {
+      exitVocabReview();
+    });
+    return;
+  }
+
+  const entry = vocabReviewState.entries[vocabReviewState.index];
+  frame.innerHTML = `
+    <div class="vocab-quiz-progress">${vocabReviewState.index + 1} / ${total}
+      <button class="vocab-quiz-cancel" type="button">退出</button>
+    </div>
+    <div class="vocab-review-term">${escapeHtml(entry.text)}</div>
+    <div class="vocab-review-meaning">${escapeHtml(entry.meaning || entry.contextZh || "") || '<span class="muted">（无释义）</span>'}</div>
+    ${entry.contextEn ? `<div class="vocab-review-context">${escapeHtml(entry.contextEn)}</div>` : ""}
+    <div class="vocab-review-meta">间隔 ${entry.interval || 0} 天 · 复习 ${entry.reviewCount || 0} 次 · 熟悉度 ${(entry.ease || YTD_VOCAB.SRS_EASE_DEFAULT).toFixed(1)}</div>
+    <div class="vocab-quiz-actions">
+      <button class="vocab-mastery mastery-new" type="button" data-srs-grade="again">忘记</button>
+      <button class="vocab-mastery mastery-fuzzy" type="button" data-srs-grade="hard">模糊</button>
+      <button class="vocab-mastery mastery-known" type="button" data-srs-grade="good">认识</button>
+    </div>
+  `;
+  box.appendChild(frame);
+  frame.querySelector(".vocab-quiz-cancel").addEventListener("click", () => {
+    exitVocabReview();
+  });
+  frame.querySelectorAll("[data-srs-grade]").forEach((button) => {
+    button.addEventListener("click", () => {
+      void gradeVocabReview(button.dataset.srsGrade);
+    });
+  });
+}
+
+// ============================================================
+// WIRING
+// ============================================================
+
+function setupStudyUi() {
+  document.getElementById("captionsToggleBtn")?.addEventListener("click", () => {
+    void toggleCaptionsHidden();
+  });
+  document.getElementById("playbackRateBtn")?.addEventListener("click", () => {
+    void cyclePlaybackRate();
+  });
+  document.getElementById("segmentsToggleBtn")?.addEventListener("click", () => {
+    toggleStudyPanel("segmentsPanel", "segmentsToggleBtn");
+  });
+  document.getElementById("dictationToggleBtn")?.addEventListener("click", () => {
+    toggleDictationPanel();
+  });
+  document.getElementById("shortcutsToggleBtn")?.addEventListener("click", () => {
+    toggleStudyPanel("shortcutsPanel", "shortcutsToggleBtn");
+  });
+  document
+    .getElementById("boundaryPauseToggle")
+    ?.addEventListener("change", (event) => {
+      boundaryPauseEnabled = Boolean(event.target.checked);
+      showStudyToast(
+        boundaryPauseEnabled ? "段落边界自动暂停：开" : "段落边界自动暂停：关",
+      );
+    });
+  document.querySelectorAll("[data-dictation-target]").forEach((button) => {
+    button.addEventListener("click", () => {
+      setDictationTarget(button.dataset.dictationTarget);
+    });
+  });
+  document
+    .getElementById("dictationCheckBtn")
+    ?.addEventListener("click", checkDictation);
+  document.getElementById("dictationReplayBtn")?.addEventListener("click", () => {
+    void replayDictation();
+  });
+  document.getElementById("dictationSaveBtn")?.addEventListener("click", () => {
+    void saveDictation();
+  });
+  document.getElementById("dictationInput")?.addEventListener("keydown", (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+      event.preventDefault();
+      checkDictation();
+    }
+  });
+  document.getElementById("vocabReviewBtn")?.addEventListener("click", () => {
+    startVocabReview();
+  });
+  document.addEventListener("keydown", handleStudyShortcut);
+  void initStudyUi();
+}
+
+async function initStudyUi() {
+  captionsHidden = await loadCaptionsHidden();
+  setCaptionsToggleButton(captionsHidden);
+  setPlaybackRateButton(playbackRate);
+  void syncPlaybackRate();
+  if (captionsHidden) {
+    // Re-apply silently: a reloaded page always shows captions again.
+    void relayToPlayer({ action: "setCaptionsHidden", hidden: true });
+  }
+}
+
+function resetStudyForVideo() {
+  sentenceLoop = null;
+  studySegments = [];
+  studyActiveSegment = -1;
+  studyVideoId = null;
+  studyPlaybackSegment = -1;
+  studyPlaybackSentenceSeconds = -1;
+  sentenceFocusIndex = -1;
+  dictationRecords = {};
+  lastDictationTarget = null;
+  lastDictationResult = null;
+  vocabReviewState = null;
+
+  const dictationPanel = document.getElementById("dictationPanel");
+  if (dictationPanel) dictationPanel.hidden = true;
+  document.getElementById("dictationToggleBtn")?.classList.remove("active");
+  const segmentsPanel = document.getElementById("segmentsPanel");
+  if (segmentsPanel) segmentsPanel.hidden = true;
+  document.getElementById("segmentsToggleBtn")?.classList.remove("active");
+  const segmentList = document.getElementById("segmentList");
+  if (segmentList) segmentList.innerHTML = "";
+  const progressEl = document.getElementById("segmentProgress");
+  if (progressEl) progressEl.textContent = "";
+  const ref = document.getElementById("dictationReference");
+  if (ref) ref.textContent = "选中一句字幕，点“听写”开始。";
+  const input = document.getElementById("dictationInput");
+  if (input) input.value = "";
+  setDictationScore("");
+  document.getElementById("dictationResult")?.replaceChildren();
+  const reviewBox = document.getElementById("vocabReview");
+  if (reviewBox) {
+    reviewBox.hidden = true;
+    reviewBox.innerHTML = "";
+  }
+
+  // Never leave the previous video's loop on the new player.
+  void relayToPlayer({
+    action: "setLoop",
+    start: 0,
+    end: null,
+    mode: "loop",
+    enabled: false,
+  });
+  // The new player starts at 1x until the page re-applies its stored speed.
+  void syncPlaybackRate();
+  void pruneStudyStorage();
 }
 
 // Pure helpers are exposed for the repository's Node tests. The extension does

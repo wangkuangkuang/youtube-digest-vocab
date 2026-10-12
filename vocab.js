@@ -15,6 +15,47 @@ var YTD_VOCAB = (() => {
   const ENTRY_CAP = 2000;
   const CLOZE_BLANK = "______";
 
+  // ——— Spaced repetition (间隔重复) ———
+  const SRS_GRADES = Object.freeze(["again", "hard", "good"]);
+  const SRS_EASE_DEFAULT = 2.5;
+  const SRS_EASE_MIN = 1.3;
+  const SRS_EASE_MAX = 2.8;
+  const DAY_MS = 86_400_000;
+
+  function readFiniteNumber(value, fallback) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+  }
+
+  function clampEase(value) {
+    return Math.min(SRS_EASE_MAX, Math.max(SRS_EASE_MIN, value));
+  }
+
+  /**
+   * Accepts a timestamp in ms, an ISO string or a Date. Missing/invalid input
+   * falls back to now so callers can omit it.
+   */
+  function toMillis(value) {
+    if (value === undefined || value === null) return Date.now();
+    if (value instanceof Date) {
+      const time = value.getTime();
+      return Number.isFinite(time) ? time : Date.now();
+    }
+    if (typeof value === "number") {
+      return Number.isFinite(value) ? value : Date.now();
+    }
+    const parsed = Date.parse(String(value));
+    return Number.isFinite(parsed) ? parsed : Date.now();
+  }
+
+  /** Missing or unparsable `due` means "needs review now". */
+  function dueTime(entry) {
+    const raw = entry && entry.due;
+    if (typeof raw !== "string" || !raw.trim()) return 0;
+    const parsed = Date.parse(raw);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
   function normalizeWhitespace(text) {
     return String(text || "")
       .replace(/\s+/g, " ")
@@ -94,6 +135,18 @@ var YTD_VOCAB = (() => {
       createdAt: Number.isFinite(input.createdAt)
         ? input.createdAt
         : Date.now(),
+      // SRS fields. Older entries simply lack them and read as "due now"
+      // (interval 0) instead of crashing anything.
+      due:
+        typeof input.due === "string" && input.due.trim()
+          ? input.due
+          : new Date(Date.now()).toISOString(),
+      interval: Math.max(0, readFiniteNumber(input.interval, 0)),
+      ease: clampEase(readFiniteNumber(input.ease, SRS_EASE_DEFAULT)),
+      reviewCount: Math.max(0, readFiniteNumber(input.reviewCount, 0)),
+      lapses: Math.max(0, readFiniteNumber(input.lapses, 0)),
+      lastReviewedAt:
+        typeof input.lastReviewedAt === "string" ? input.lastReviewedAt : "",
     };
   }
 
@@ -235,9 +288,95 @@ var YTD_VOCAB = (() => {
       if (patch && typeof patch.meaning === "string") {
         merged.meaning = patch.meaning.trim();
       }
+      // SRS fields are validated field by field, so a bad patch can never
+      // write garbage into storage. The background worker reuses this
+      // function, which is how review grades reach the saved entry.
+      if (patch) applySrsPatch(merged, patch);
       return merged;
     });
     return { entries: next, updated: updated };
+  }
+
+  function applySrsPatch(entry, patch) {
+    if (typeof patch.due === "string" && patch.due.trim()) {
+      entry.due = patch.due;
+    }
+    if (patch.interval !== undefined) {
+      entry.interval = Math.max(0, readFiniteNumber(patch.interval, entry.interval || 0));
+    }
+    if (patch.ease !== undefined) {
+      entry.ease = clampEase(readFiniteNumber(patch.ease, entry.ease || SRS_EASE_DEFAULT));
+    }
+    if (patch.reviewCount !== undefined) {
+      entry.reviewCount = Math.max(
+        0,
+        readFiniteNumber(patch.reviewCount, entry.reviewCount || 0),
+      );
+    }
+    if (patch.lapses !== undefined) {
+      entry.lapses = Math.max(0, readFiniteNumber(patch.lapses, entry.lapses || 0));
+    }
+    if (typeof patch.lastReviewedAt === "string") {
+      entry.lastReviewedAt = patch.lastReviewedAt;
+    }
+    return entry;
+  }
+
+  /**
+   * SM-2, simplified to three grades (忘记 / 模糊 / 认识).
+   *
+   *   again -> interval 0 (same-day retry), ease -0.2, lapses +1, 未掌握
+   *   hard  -> interval max(1, round(interval * 1.2)), 模糊
+   *   good  -> interval 1 on the first pass, then round(interval * ease), 已掌握
+   *
+   * Ease is clamped to [1.3, 2.8], `due` becomes now + interval days, and
+   * `reviewCount` always increments. Returns a new entry; the input is never
+   * mutated. An unknown grade returns a normalized copy unchanged.
+   */
+  function applySrsGrade(entry, grade, now) {
+    const base = normalizeVocabEntry(entry || {});
+    if (!SRS_GRADES.includes(grade)) return base;
+
+    const time = toMillis(now);
+    let interval = base.interval;
+    let ease = base.ease;
+    let lapses = base.lapses;
+    let mastery = base.mastery;
+
+    if (grade === "again") {
+      interval = 0;
+      ease = clampEase(ease - 0.2);
+      lapses += 1;
+      mastery = "new";
+    } else if (grade === "hard") {
+      interval = Math.max(1, Math.round(interval * 1.2));
+      mastery = "fuzzy";
+    } else {
+      interval = interval < 1 ? 1 : Math.round(interval * ease);
+      mastery = "known";
+    }
+
+    return Object.assign(base, {
+      interval: interval,
+      ease: ease,
+      lapses: lapses,
+      mastery: mastery,
+      reviewCount: base.reviewCount + 1,
+      lastReviewedAt: new Date(time).toISOString(),
+      due: new Date(time + interval * DAY_MS).toISOString(),
+    });
+  }
+
+  function isDue(entry, now) {
+    return dueTime(entry) <= toMillis(now);
+  }
+
+  /** Due entries, most overdue first. Missing `due` counts as due. */
+  function dueEntries(entries, now) {
+    const time = toMillis(now);
+    return (entries || [])
+      .filter((entry) => entry && isDue(entry, time))
+      .sort((a, b) => dueTime(a) - dueTime(b));
   }
 
   function applyVocabDelete(entries, id) {
@@ -379,7 +518,10 @@ var YTD_VOCAB = (() => {
           ankiField(e.meaning || e.contextZh) +
           "<br>source: " +
           ankiField(e.videoTitle);
-        return front + "\t" + back;
+        // `due` is appended last so existing Anki mappings keep their columns.
+        return (
+          front + "\t" + back + "\t" + ankiField(typeof e.due === "string" ? e.due : "")
+        );
       })
       .join("\n");
   }
@@ -389,6 +531,11 @@ var YTD_VOCAB = (() => {
     MASTERY_LABELS,
     ENTRY_CAP,
     CLOZE_BLANK,
+    SRS_GRADES,
+    SRS_EASE_DEFAULT,
+    SRS_EASE_MIN,
+    SRS_EASE_MAX,
+    DAY_MS,
     normalizeWhitespace,
     hasCJK,
     isSingleWord,
@@ -401,6 +548,9 @@ var YTD_VOCAB = (() => {
     applyVocabSave,
     applyVocabUpdate,
     applyVocabDelete,
+    applySrsGrade,
+    isDue,
+    dueEntries,
     resolveMeaningSource,
     blankFirstOccurrence,
     generateClozeQuestions,

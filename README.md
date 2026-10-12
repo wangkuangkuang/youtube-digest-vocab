@@ -27,6 +27,14 @@ YouTube Digest is a bring-your-own-key project installed locally from GitHub. It
 - Explain selected transcript text or save it directly as a timestamped note.
 - Keep your transcript position across navigation, with the panel closing automatically outside YouTube video pages.
 
+## New in v1.3.0
+
+- Hide the page captions from the panel (字幕：开 / 关), with the choice remembered per browser and re-applied on every video.
+- Replay or loop a single sentence from two small buttons on every transcript line, alongside the existing click-to-seek.
+- Cut a video into study segments of at most 20 minutes, using YouTube chapters when they exist and time-based blocks when they do not. Progress is stored per video.
+- Type what you hear and get a word-level diff with an accuracy score, saved per segment.
+- Spaced repetition for the vocabulary notebook: 今日到期 counts what is due, and 忘记 / 模糊 / 认识 reschedule it.
+
 ## Install with your coding agent
 
 You do not need to understand the code or use the command line. Send this message to your coding agent:
@@ -112,6 +120,32 @@ Keys and settings are stored in Chrome's local extension storage on your device.
 7. Review saved vocabulary in **单词本**: set mastery, jump back to the source sentence, listen again, hear it spoken, run **自测** cloze drills, or export to CSV and Anki.
 8. Save a note from the player or a key quote, then revisit it from **Notes**.
 
+## English dictation workflow
+
+This fork adds the missing half of a listen-and-transcribe drill, entirely on your machine with no extra API calls.
+
+1. **Hide the page captions and slow the speaker down.** In **Transcript**, click **字幕：开** (it flips to **字幕：关**) and start the video again from the top. The choice is remembered and re-applied on the next video. If the speaker is still too fast to transcribe, **速度** in the same toolbar cycles the gears from `0.5×` to `2×`, and `[` or `]` steps one gear at a time; the speed is remembered the same way, and Chrome keeps the pitch, so only the tempo changes.
+2. **Cut the video into study segments.** **段落** prefers YouTube's own chapters and merges consecutive chapters into blocks of at most 20 minutes. Videos without chapters are chunked by time and titled like `Segment 2 · 24:10–41:33`. Click a segment to jump there, and use **标记完成** to tick it off. Progress is saved per video and restored when you reopen it.
+3. **Replay one sentence at a time.** Every transcript line now carries a replay button and a loop button. Clicking the line itself still seeks. While a sentence loops, its row is outlined, and clicking another sentence moves the loop there instead of leaving the old range behind.
+4. **Write down what you hear.** Open **听写** and choose **本句** or **本段**. Type the English in the box, then click **批改** (Cmd/Ctrl + Enter works too). Missing words are struck through in red, wrong words turn orange and show what you typed, extra words are struck through in gray. The header reports accuracy and mistake counts. **保存** stores `{text, accuracy}` for that segment and loads it back when you return.
+5. **Review the words that are due.** **今日到期 N** in **单词本** counts saved entries whose scheduled review has arrived. Each card offers **忘记 / 模糊 / 认识**, which applies a simplified SM-2 grade, updates the mastery label, and schedules the next review. CSV export is unchanged; Anki export appends the `due` date as a third column.
+
+Shortcuts run in the side panel's own document, so they never reach YouTube's player. They are all ignored while the focus is inside a text box (Escape releases the focus) and while a modifier key is held.
+
+| Key | Action |
+| --- | --- |
+| `Space` | Play / pause |
+| `↑` / `↓` | Previous / next sentence |
+| `R` | Replay the current sentence |
+| `L` | Loop the current sentence |
+| `C` | Toggle the captions overlay |
+| `[` | One step slower |
+| `]` | One step faster |
+| `D` | Open or close the dictation panel |
+| `Cmd / Ctrl + Enter` | Grade the dictation in the text box |
+
+The caption overlay, playback speed, sentence loop, and chapter lookup are page-side actions. If the site's `content.js` is still an older build, the panel tells you to reload the YouTube page instead of failing silently.
+
 ## What works today
 
 - Google Chrome 116 or newer, using the Side Panel API.
@@ -121,6 +155,7 @@ Keys and settings are stored in Chrome's local extension storage on your device.
 - AI overviews, selected-text explanations, translation, and automatic note polishing.
 - Vocabulary notebook: selection dictionary lookups, saved entries with bilingual context and timestamps, mastery tracking, re-appearance highlighting, listen-back, pronunciation, CSV/Anki export, and cloze self-testing.
 - Local notes and a local cache for recent transcript and digest results.
+- English dictation drill: caption overlay, speed control from `0.5×` to `2×`, per-sentence replay and loop, study segments with per-video progress, a word-level dictation grader, and spaced-repetition review of saved words.
 - DeepSeek V4 Flash for all published AI features. Other providers require a local code adaptation and are not supported by this published version.
 
 Shorts, live streams, private or access-restricted videos, and videos without an available native transcript may not work. Firefox, Safari, mobile browsers, and other Chromium browsers are not currently tested or supported.

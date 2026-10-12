@@ -179,6 +179,137 @@
                 </button>
               </div>
             </div>
+            <!-- Study workflow (逐句听写): captions遮罩 / 段落 / 听写 / 快捷键 -->
+            <div class="study-toolbar" id="studyToolbar">
+              <button
+                class="study-tool-btn"
+                id="captionsToggleBtn"
+                type="button"
+                aria-pressed="false"
+                title="遮挡 YouTube 页面字幕（C）"
+              >
+                字幕：开
+              </button>
+              <button
+                class="study-tool-btn"
+                id="playbackRateBtn"
+                type="button"
+                title="播放速度，点击切换（[ 降速 / ] 提速）"
+              >
+                速度 1×
+              </button>
+              <button
+                class="study-tool-btn"
+                id="segmentsToggleBtn"
+                type="button"
+                aria-expanded="false"
+              >
+                段落
+              </button>
+              <button
+                class="study-tool-btn"
+                id="dictationToggleBtn"
+                type="button"
+                aria-expanded="false"
+                title="打开听写面板（D）"
+              >
+                听写
+              </button>
+              <button
+                class="study-tool-btn"
+                id="shortcutsToggleBtn"
+                type="button"
+                aria-expanded="false"
+              >
+                快捷键
+              </button>
+            </div>
+
+            <div class="study-panel" id="segmentsPanel" hidden>
+              <div class="study-panel-head">
+                <span class="study-panel-title">学习段落</span>
+                <label class="study-checkbox">
+                  <input type="checkbox" id="boundaryPauseToggle" />
+                  段落边界暂停
+                </label>
+              </div>
+              <div class="study-segments" id="segmentList"></div>
+              <div class="study-progress" id="segmentProgress"></div>
+            </div>
+
+            <div class="study-panel" id="dictationPanel" hidden>
+              <div class="study-panel-head">
+                <span class="study-panel-title">逐句听写</span>
+                <span class="study-target-switch" role="group" aria-label="听写范围">
+                  <button
+                    class="study-tool-btn active"
+                    type="button"
+                    data-dictation-target="sentence"
+                    aria-pressed="true"
+                  >
+                    本句
+                  </button>
+                  <button
+                    class="study-tool-btn"
+                    type="button"
+                    data-dictation-target="segment"
+                    aria-pressed="false"
+                  >
+                    本段
+                  </button>
+                </span>
+              </div>
+              <div class="dictation-reference" id="dictationReference">
+                选中一句字幕，点“听写”开始。
+              </div>
+              <textarea
+                class="dictation-input"
+                id="dictationInput"
+                rows="4"
+                placeholder="写下你听到的英文"
+                spellcheck="false"
+                autocorrect="off"
+                autocapitalize="off"
+                aria-label="听写输入"
+              ></textarea>
+              <div class="study-actions">
+                <button
+                  class="study-btn"
+                  id="dictationCheckBtn"
+                  type="button"
+                  title="批改（Cmd/Ctrl + Enter）"
+                >
+                  批改
+                </button>
+                <button class="study-btn" id="dictationReplayBtn" type="button">
+                  重听
+                </button>
+                <button class="study-btn" id="dictationSaveBtn" type="button">
+                  保存
+                </button>
+                <span class="dictation-score" id="dictationScore"></span>
+              </div>
+              <div class="dictation-result" id="dictationResult"></div>
+            </div>
+
+            <div class="study-panel study-shortcuts" id="shortcutsPanel" hidden>
+              <div class="study-panel-head">
+                <span class="study-panel-title">快捷键</span>
+                <span class="study-panel-note">输入框内自动失效</span>
+              </div>
+              <dl class="shortcut-list">
+                <div><dt>Space</dt><dd>播放 / 暂停</dd></div>
+                <div><dt>↑ / ↓</dt><dd>上一句 / 下一句</dd></div>
+                <div><dt>R</dt><dd>重播当前句</dd></div>
+                <div><dt>L</dt><dd>循环当前句</dd></div>
+                <div><dt>C</dt><dd>切换字幕遮挡</dd></div>
+                <div><dt>[ / ]</dt><dd>降速 / 提速</dd></div>
+                <div><dt>D</dt><dd>打开 / 关闭听写面板</dd></div>
+                <div><dt>Esc</dt><dd>从输入框失焦</dd></div>
+                <div><dt>Cmd / Ctrl + Enter</dt><dd>批改听写</dd></div>
+              </dl>
+            </div>
+
             <div id="transcriptList"></div>
           </div>
         </div>
@@ -263,6 +394,14 @@
                 <button class="enhance-btn" id="vocabQuizBtn" type="button">
                   自测
                 </button>
+                <button
+                  class="enhance-btn"
+                  id="vocabReviewBtn"
+                  type="button"
+                  title="间隔重复复习"
+                >
+                  今日到期 <span id="vocabDueCount">0</span>
+                </button>
                 <button class="enhance-btn" id="vocabExportCsvBtn" type="button">
                   CSV
                 </button>
@@ -284,6 +423,7 @@
               在字幕中选中单词、短语或句子，点“收藏到单词本”即可保存。
             </p>
             <div id="vocabQuiz" class="vocab-quiz" hidden></div>
+            <div id="vocabReview" class="vocab-quiz" hidden></div>
             <div id="vocabList"></div>
           </div>
         </div>
@@ -301,6 +441,7 @@
 
     <script src="settings.js"></script>
     <script src="vocab.js"></script>
+    <script src="study.js"></script>
     <script src="sidepanel.js"></script>
   </body>
 </html>

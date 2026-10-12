@@ -29,8 +29,10 @@ test("toCsv escapes commas, quotes and newlines", () => {
 
 test("toAnkiTsv strips tabs/newlines and bolds the term", () => {
   const tsv = vocab.toAnkiTsv([entry]);
-  const [front, back] = tsv.split("\t");
+  const [front, back, due] = tsv.split("\t");
   assert.equal(front, 'run, "fast"<br>He likes to <b>run, fast</b>');
   assert.match(back, /^\/rʌn\/ v\. 跑 ; 运转<br>source: A, Title$/);
+  // The due column is appended last, so legacy mappings keep columns 1-2.
+  assert.equal(due, "");
   assert.equal(tsv.includes("\n"), false);
 });
